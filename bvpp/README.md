@@ -37,21 +37,21 @@ bvppという名称は、天体写真のモザイク合成に使われるAstro P
 <br><br>
 
 # インストール方法
-実行に必要なツールやライブラリをインストールする。Ubuntuの場合。macOSだと一行目は`sudo apt ...`の代わりに`brew install exiftool`など。
+まず実行に必要なツールやライブラリをインストールする。Ubuntuの場合は以下の通り。macOSだと一行目は`sudo apt ...`の代わりに`brew install exiftool`など。
 ```
 sudo apt install -y exiftool
 pip install pillow numpy exifread PyQt6
 ```
 
-本プログラムをお使いの環境にCloneする。または単に`bvpp.py`を自分の環境にコピーするだけで良いです。
+本プログラムをお使いの環境にCloneする。または単に`bvpp.py`ファイルを自分の環境にコピーするだけでも良いです。
 ```
-git clone https://github.com/dante-12/bvpp.git
+git clone git@github.com:dante-12/bird-detection.git
 ```
 <br>
 
 # 使い方
 1. 準備
-    * モザイク合成したい画像を、どこかのフォルダに入れる。以下、仮に`./numa/`とする。合成に含めたくない画像はそのフォルダには入れないこと。
+    * モザイク合成したい画像を、まとめてどこかのフォルダに入れる。以下、仮に`./numa/`とする。合成に含めたくない画像はそのフォルダには入れないこと。
     * 撮影対象（地上・水面）の標高が何メートルか調べる。以下、仮に`-2.5m`とする。
 
 2. 実行方法 - 簡略版 (<a href="docs/README-detail.md">詳細版はこちら</a>)
