@@ -29,7 +29,7 @@ bvppという名称は、天体写真のモザイク合成に使われるAstro P
 * 撮影時にカメラがRoll（水平でなくなる）していないこと(Gimbal Roll Degreeが0かnullであること) --inspect-onlyオプションで入力画像を検査できます。
 * 撮影対象の地面あるいは水面が平らであること
 
-## 既知の制限
+## 既知の問題
 * GUIでズームすると解像度が極端に粗く見えますが、動作速度を安定させるための仕様です。Saveする際には元の解像度の画像を使います。
 * GUIの動きが全体に緩慢です。キーボードを連打せず、何かキーを押したら画面が更新されるのを待ってください。
 * 日本語のディレクトリ名やファイル名の扱いは未テスト
@@ -37,9 +37,9 @@ bvppという名称は、天体写真のモザイク合成に使われるAstro P
 <br><br>
 
 # インストール方法
-まず実行に必要なツールやライブラリをインストールする。Ubuntuの場合は以下の通り。macOSだと一行目は`sudo apt ...`の代わりに`brew install exiftool`など。
+まず実行に必要なツールやライブラリをインストールする。Ubuntuの場合は以下の通り。macOSだと一行目は`sudo apt ...`の代わりに`brew install exiftool libxcb-cursor0`など。
 ```
-sudo apt install -y exiftool
+sudo apt install -y exiftool libxcb-cursor0
 pip install pillow numpy exifread PyQt6
 ```
 
@@ -57,14 +57,14 @@ git clone git@github.com:dante-12/bird-detection.git
 2. 実行方法 - 簡略版 (<a href="docs/README-detail.md">詳細版はこちら</a>)
 
     ```
-    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-gimbal-only
+    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-flight-only
     ```
 
     実行後、保存した画像（この例では`numa-00.jpg`）をチェックして意図通りの合成になっているか確認する。なっていればここで完了です。
     
     何かが大きくズレているなら、おそらく各画像の回転角度が誤っているか、拡大縮小率（--lake-altとExifのRelative Altitudeから逆算したカメラから被写体までの距離による）が誤っていると思われます。`--gui`オプションをつけて起動して、試行錯誤してみてください。キーボードからの操作で拡大縮小や回転が行えます。GUIの動きは遅いのでキーを押したら画面が更新されるまで待ち、連打はしないでください。
     ```
-    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-gimbal-only --gui
+    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-flight-only --gui
     ```
 
     GUI上で、あるべきパラメータが絞れたら、そのまま`Save`ボタンで保存しましょう。GUIに表示されているAltitudeやYaw offsetの数字を覚えておけば、次回以降はコマンドラインオプションからの指定で、GUIなしで保存することもできます。
@@ -88,10 +88,10 @@ git clone git@github.com:dante-12/bird-detection.git
     
     この値とExifのRelative Altitudeを足して、カメラから対象までの距離とみなす。マイナス値も可。Relative Altitudeの値は正確ではない場合があるので、このオプションで微調整する。GUIからも調整可能。
 
-## ドローンとカメラの水平方向の向き
+## ドローンとカメラの水平方向の向きの解釈方法
     * オプションをつけない場合はExifのFlight Yaw DegreeとGimbal Yaw Degreeを足した角度だけ画像を回転させる
     * --yaw-gimbal-only : Gimbal Yaw Degreeだけ画像を回転させる
-    * --yaw-flight-only : Flight Yaw Degreeだけ画像を回転させる
+    * --yaw-flight-only : Flight Yaw Degreeだけ画像を回転させる。推奨値。最初はこれを試してみてください。
     * --yaw-invert : Yaw Degreeは北方向から時計回りに数えるが、このオプションが指定されると反時計回りと見なす
     * --yaw-offset 角度 : 指定した角度だけ時計回りに画像を回転させる
 

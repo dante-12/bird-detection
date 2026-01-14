@@ -7,12 +7,12 @@
 2. 対象の画像に必要なExifのデータが含まれているか確認  
     次のコマンドを実行して、モザイク合成に使用する画像が意図したExif情報を持っているか、Gimbal Pitch/Rollの値が想定内か確認する。
     ```
-    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-gimbal-only --inspect-only
+    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-flight-only --inspect-only
     ```
     * `--in` 処理する画像ファイルの入ったディレクトリ名。必ず""でくくること。
     * `--out` モザイク合成した画像を保存する先。
     * `--lake-alt` 1で調べた地面か水面の標高。
-    * `--yaw-gimbal-only` 画像合成する際の回転角度にExifのGimbal Yaw Degreeを使う指定
+    * `--yaw-flight-only` 画像合成する際の回転角度にExifのFlight Yaw Degreeを使う指定
     * `--inspect-only` 処理する画像ファイルのExif情報を精査して、その後何もせずプログラムを終了する
 
     次の出力例の通り全項目について`=OK`が出ていれば問題なし。rollのみOKではなく`=-`となるかも。それはそれでよし。お使いのドローンがDJI製ならここで問題が出ることはないはず。
@@ -30,7 +30,7 @@
 3. 最初の実行
 
     ```
-    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-gimbal-only
+    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-flight-only
     ```
 
     実行後、この例では`numa-00.jpg`をチェックして意図通りの合成になっているか確認する。なっていればここで完了です。何かが大きくズレているなら、これ以降のステップに進む。
@@ -43,13 +43,13 @@
 
     このような場合はGUIを起動して試行錯誤してみましょう。`--gui`オプションをつけて起動してください。
     ```
-    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-gimbal-only --gui
+    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-flight-only --gui
     ```
     すると、このページの一番上にあるような画面が表示されます。まずは回転角度を調整してみてください。ウィンドウ下部にある以下のメニューを使います。
 
     <img src="image_rotation_rule.png" alt="Image Rotation Rule">
 
-    ここから色々組み合わせを選んでみて（全6通り）、意図した角度になる組み合わせを見つけてください。意味は次の通りです。DJIドローンの場合、たいていは"Use Gimbal Yaw Degree"が正解だと思われますが、そうではない場合があるため、この機能を設けました。
+    ここから色々組み合わせを選んでみて（全6通り）、意図した角度になる組み合わせを見つけてください。意味は次の通りです。DJIドローンの場合、たいていは"Use Flight Yaw Degree"が正解だと思われますが、そうではない場合があるため、この機能を設けました。
     * Use Flight + Gimbal Yaw Degree - Flight YawとGimbal Yawを足した角度だけ回転させる
     * Use Gimbal Yaw Degree - Gimbal Yawの角度だけ回転させる
     * Use Flight Yaw Degree - Flight Yawの角度だけ回転させる
@@ -70,4 +70,4 @@
 
     <img src="attr_panel.png">
 
-    上記の例だと`python bvpp.py .... --lake-alt 5.7 --yaw-offset 0 --yaw-invert`となります。
+    上記の例だと`python bvpp.py .... --lake-alt 5.7 --yaw-offset -10 --yaw-gimbal-only --yaw-invert`となります。Altitude枠に書かれている"Avg Relative Altitude"というのは、全ての画像のRelative Altitude値の平均で、ドローンが認識している高度の平均値です。
