@@ -45,7 +45,7 @@ pip install pillow numpy exifread PyQt6
 
 本プログラムをお使いの環境にCloneする。または単に`bvpp.py`ファイルを自分の環境にコピーするだけでも良いです。
 ```
-git clone git@github.com:dante-12/bird-detection.git
+git clone https://github.com/dante-12/bird-detection.git
 ```
 <br>
 
