@@ -1,6 +1,21 @@
 # Bird Detection Tools
 鳥の自動検出に関連して作った色んなツールをここで公開します。
 
+# インストール方法
+本プログラムをお使いの環境にCloneする。または個別の`*.py`ファイルを自分の環境にコピーするだけでも良いです。
+```
+git clone https://github.com/dante-12/bird-detection.git
+```
+
+次に実行に必要なツールやライブラリをインストールする。Ubuntuの場合は以下の通り。macOSだと一行目は`sudo apt ...`の代わりに`brew install ...`など。
+
+```
+sudo apt install -y exiftool libxcb-cursor0
+pip install pillow numpy exifread PyQt6 ultralytics sahi
+```
+
+<br>
+
 # ツール一覧
 * <a href="bvpp/README.md">Bird View Pixel Processor</a>
 

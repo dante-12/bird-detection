@@ -37,17 +37,8 @@ bvppという名称は、天体写真のモザイク合成に使われるAstro P
 <br><br>
 
 # インストール方法
-まず実行に必要なツールやライブラリをインストールする。Ubuntuの場合は以下の通り。macOSだと一行目は`sudo apt ...`の代わりに`brew install exiftool libxcb-cursor0`など。
-```
-sudo apt install -y exiftool libxcb-cursor0
-pip install pillow numpy exifread PyQt6
-```
+<a href="../README.md">トップページ参照</a>。または`bvpp.py`ファイルを自分の環境にコピーするだけでも良いです。
 
-本プログラムをお使いの環境にCloneする。または単に`bvpp.py`ファイルを自分の環境にコピーするだけでも良いです。
-```
-git clone https://github.com/dante-12/bird-detection.git
-```
-<br>
 
 # 使い方
 1. 準備
@@ -57,6 +48,7 @@ git clone https://github.com/dante-12/bird-detection.git
 2. 実行方法 - 簡略版 (<a href="docs/README-detail.md">詳細版はこちら</a>)
 
     ```
+    $ cd bvpp
     $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --lake-alt -2.5 --yaw-flight-only
     ```
 
