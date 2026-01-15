@@ -1,7 +1,7 @@
 # Bird Detection Tools
 鳥の自動検出に関連して作った色んなツールをここで公開します。
 
-<br>
+<br><br>
 
 # インストール方法
 本プログラムをお使いの環境にCloneする。または個別の`*.py`ファイルを自分の環境にコピーするだけでも良いです。
@@ -16,7 +16,7 @@ sudo apt install -y exiftool libxcb-cursor0
 pip install pillow numpy exifread PyQt6 ultralytics sahi
 ```
 
-<br>
+<br><br>
 
 # ツール一覧
 * <a href="bvpp/README.md">Bird View Pixel Processor</a>
@@ -27,17 +27,17 @@ pip install pillow numpy exifread PyQt6 ultralytics sahi
 
     沼の写真をモザイク合成した巨大な画像からYOLOを使って鳥を検出するためのプログラムです。内部的には<a href="https://github.com/obss/sahi">SAHI</a>を使って画像を分割、YOLOで検出し、結果に基づいて、元の画像に様々な条件でラベリングを行います。
 
-<br>
+<br><br>
 
 # 謝辞
 開発にあたって、画像の提供や評価、アドバイスなどをいただいた神山和夫様に感謝します。
 
-<br>
+<br><br>
 
 # Contributing
 不具合の報告や改善提案、Pull Request は歓迎します。
 
-<br>
+<br><br>
 
 # ライセンス
 MIT License
