@@ -27,6 +27,12 @@ def parse_args():
     p.add_argument("--image-path", required=True, help="path to input image")
     p.add_argument("--slice-height", type=int, default=512)
     p.add_argument("--slice-width", type=int, default=512)
+    p.add_argument(
+        "--overlap-ratio",
+        type=float,
+        default=0.2,
+        help="slice overlap ratio for both height/width (default: 0.2)",
+    )
     p.add_argument("--confidence", type=float, default=0.6)
     p.add_argument("--yolo-conf", type=float, default=0.2, help="YOLO confidence_threshold (default: 0.2)")
     p.add_argument("--show-size", action="store_true", help="draw bbox W/H (px) and print per-class bbox size stats")
@@ -71,19 +77,24 @@ Image.MAX_IMAGE_PIXELS = None
 im = Image.open(image_path).convert("RGB")
 w, h = im.size
 
-print("--- params ---")
-print(f"GPU_available: {_cuda_ok}")
-print(f"device: {device}")
-print(f"model: {os.path.basename(model_path)}")
-print(f"image: {os.path.basename(image_path)}")
-print(f"image_size: {w} x {h}")
-print(f"slice_height: {args.slice_height}")
-print(f"slice_width: {args.slice_width}")
-print(f"confidence limit (for counting): {args.confidence}")
-print(f"yolo_confidence_threshold: {YOLO_CONFIDENCE_THRESHOLD}")
-print(f"width range limit (for counting): {args.w_range}")
-print(f"height range limit (for counting): {args.h_range}")
-print("-------------")
+param_lines = [
+    "--- params ---",
+    f"GPU_available: {_cuda_ok}",
+    f"device: {device}",
+    f"model: {os.path.basename(model_path)}",
+    f"image: {os.path.basename(image_path)}",
+    f"image_size: {w} x {h}",
+    f"slice_height: {args.slice_height}",
+    f"slice_width: {args.slice_width}",
+    f"overlap_ratio: {args.overlap_ratio}",
+    f"confidence limit (for counting): {args.confidence}",
+    f"yolo_confidence_threshold: {YOLO_CONFIDENCE_THRESHOLD}",
+    f"width range limit (for counting): {args.w_range}",
+    f"height range limit (for counting): {args.h_range}",
+    "-------------",
+]
+for line in param_lines:
+    print(line)
 
 # モデル作成
 
@@ -99,8 +110,8 @@ result = get_sliced_prediction(
     detection_model,
     slice_height=args.slice_height,
     slice_width=args.slice_width,
-    overlap_height_ratio=0.2,
-    overlap_width_ratio=0.2,
+    overlap_height_ratio=args.overlap_ratio,
+    overlap_width_ratio=args.overlap_ratio,
 )
 
 print("SAHI processing completed. Preparing visualization...")
@@ -427,6 +438,30 @@ if args.show_size:
             print(f"    {label}: {count:>6} {bar}")
         print()
 
+if args.show_size:
+    # CLI出力と同じ params を左上にオーバーレイ
+    overlay_margin = 8
+    overlay_pad = 4
+    line_gap = 2
+    text_color = (255, 255, 255)
+    bg_color = (0, 0, 0)
+
+    line_sizes = [_text_size(draw, line, font_label) for line in param_lines]
+    max_w = max((tw for tw, _ in line_sizes), default=0)
+    total_h = sum(th for _, th in line_sizes) + max(0, len(line_sizes) - 1) * line_gap
+
+    left = overlay_margin
+    top = overlay_margin
+    right = min(w - 1, left + max_w + overlay_pad * 2)
+    bottom = min(h - 1, top + total_h + overlay_pad * 2)
+    draw.rectangle([left, top, right, bottom], fill=bg_color)
+
+    tx = left + overlay_pad
+    ty = top + overlay_pad
+    for line, (_, th) in zip(param_lines, line_sizes):
+        draw.text((tx, ty), line, fill=text_color, font=font_label)
+        ty += th + line_gap
+
 # CSV出力（指定された場合）
 if args.csv:
     import csv
@@ -434,22 +469,38 @@ if args.csv:
     csv_path = args.csv
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         wtr = csv.writer(f)
-        wtr.writerow(["cls", "bbox_w", "bbox_h", "conf"])
+        wtr.writerow(["class", "class_id", "confidence", "x1", "x2", "y1", "y2", "bbox_w", "bbox_h"])
         for op in result.object_prediction_list:
-            # cls
-            cls = None
+            # class name / class id
+            cls_name = None
+            cls_id = None
             try:
-                cls = op.category.name
+                cls_name = op.category.name
             except Exception:
+                cls_name = None
+            try:
+                cls_id = op.category.id
+            except Exception:
+                cls_id = None
+            if not cls_name:
                 try:
-                    cls = str(op.category.id)
+                    cls_name = str(op.category.id)
                 except Exception:
-                    cls = None
-            if not cls:
-                cls = "unknown"
+                    cls_name = "unknown"
+            if cls_id is None and cls_name != "unknown":
+                try:
+                    cls_id = int(cls_name)
+                except Exception:
+                    cls_id = ""
+            elif cls_id is None:
+                cls_id = ""
 
-            # bbox size
+            # bbox coords / size
             x1, y1, x2, y2 = map(int, op.bbox.to_xyxy())
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if y2 < y1:
+                y1, y2 = y2, y1
             bbox_w = max(0, x2 - x1)
             bbox_h = max(0, y2 - y1)
 
@@ -463,7 +514,19 @@ if args.csv:
                 except Exception:
                     conf = None
 
-            wtr.writerow([cls, bbox_w, bbox_h, "" if conf is None else f"{conf:.6f}"])
+            wtr.writerow(
+                [
+                    cls_name,
+                    cls_id,
+                    "" if conf is None else f"{conf:.6f}",
+                    x1,
+                    x2,
+                    y1,
+                    y2,
+                    bbox_w,
+                    bbox_h,
+                ]
+            )
     print("csv saved:", csv_path)
 
 # 保存ファイル名: inputのファイル名 + "_detect" (+ 連番) + 拡張子
