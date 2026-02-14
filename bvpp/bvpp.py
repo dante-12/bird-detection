@@ -54,8 +54,11 @@ try:
 except ImportError:
     QtCore = QtGui = QtWidgets = None
 
+# Pillowで巨大画像を扱う（必要なら制限解除）
+Image.MAX_IMAGE_PIXELS = None
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
+MAX_JPG_TIF_DIM_PX = 65535
 
 # Metadata keys we expect to use (as seen by exifread)
 INSPECT_KEYS: Dict[str, Tuple[str, ...]] = {
@@ -91,13 +94,15 @@ class PhotoMeta:
     yaw_deg: float  # clockwise from true north
     hfov_deg: float
     pitch_deg: float = -90.0  # degrees; -90 is nadir
+    flight_pitch_deg: Optional[float] = None
+    gimbal_pitch_deg: Optional[float] = None
 
 
 @dataclass(frozen=True)
 class RenderOptions:
     undistort: bool = False
     k1: float = 0.0  # positive -> barrel, negative -> pincushion (simple model)
-    lake_alt_m: float = 0.0  # target surface altitude; effective altitude = alt_m - lake_alt_m
+    alt_correction_m: float = 0.0  # effective altitude = Relative Altitude + alt_correction_m
     yaw_offset_deg: float = 0.0  # additional yaw correction (degrees, clockwise from north)
     yaw_invert: bool = False  # if True, use -yaw (legacy behavior)
     yaw_gimbal_only: bool = False  # if True, ignore Flight Yaw Degree and use only Gimbal Yaw Degree
@@ -107,11 +112,12 @@ class RenderOptions:
     roi_margin_px: int = 8
     jpg_quality: int = 95  # JPEG quality (1-95 typical)
     png_compress_level: int = 6  # PNG compress_level (0-9)
+    preview_max_dim: int = 2048  # GUI preview max width/height in pixels
 
 
 def _effective_alt_m(meta: PhotoMeta, options: RenderOptions) -> float:
-    # camera-to-target shortest distance approximation (includes lake_alt)
-    eff = float(meta.alt_m) - float(getattr(options, "lake_alt_m", 0.0))
+    # camera-to-target shortest distance approximation (includes altitude correction)
+    eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
     # If camera is tilted, effective vertical height to the plane is eff*cos(tilt)
     tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
     eff = eff * max(math.cos(math.radians(tilt_deg)), 0.01)
@@ -618,12 +624,14 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
     lat, lon = _extract_lat_lon(tags)
     alt = _extract_alt(tags)
     yaw = _extract_yaw(tags, options)
+    flight_pitch = _extract_flight_pitch(tags)
+    gimbal_pitch = _extract_gimbal_pitch(tags)
 
     pitch = _extract_pitch(tags)
     if pitch is not None:
         # Expected around -90 deg (nadir)
         if abs(float(pitch) - (-90.0)) > 10.0:
-            sys.stderr.write(f"WARN: pitch not near -90 deg: {path} pitch={pitch}\n")
+            sys.stderr.write(f"WARN: Total of Gimbal Pitch + Flight Pitch degree not near -90 deg: {path} pitch={pitch}\n")
 
     hfov = _extract_fov(tags, w, h)
 
@@ -654,6 +662,8 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
         yaw_deg=float(yaw) % 360.0,
         hfov_deg=float(hfov),
         pitch_deg=float(pitch) if pitch is not None else -90.0,
+        flight_pitch_deg=float(flight_pitch) if flight_pitch is not None else None,
+        gimbal_pitch_deg=float(gimbal_pitch) if gimbal_pitch is not None else None,
     )
 
 
@@ -730,7 +740,7 @@ def _project_corners(meta: PhotoMeta, origin_lat: float, origin_lon: float, opti
     # If camera is tilted, shift ground intersection of image center forward.
     # Approx: forward displacement = alt * tan(tilt)
     if options is not None:
-        alt_eff = float(meta.alt_m) - float(getattr(options, "lake_alt_m", 0.0))
+        alt_eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
         tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
         forward = alt_eff * math.tan(math.radians(tilt_deg))
         top_world = _yaw_to_top_world(meta.yaw_deg, options)
@@ -1085,6 +1095,21 @@ def _save_image_with_options(img_rgb: Image.Image, out_path: str, options: Rende
     img_rgb.save(out_path)
 
 
+def _ensure_output_dimension_limit(out_path: str, canvas_w: int, canvas_h: int) -> None:
+    """Abort when JPEG/TIFF output exceeds the practical 64k-side limit."""
+    ext = os.path.splitext(out_path)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".tif", ".tiff"):
+        return
+
+    if canvas_w > MAX_JPG_TIF_DIM_PX or canvas_h > MAX_JPG_TIF_DIM_PX:
+        raise SystemExit(
+            "WARNING: The computed canvas size is "
+            f"{canvas_w}x{canvas_h}, and one side exceeds 64K pixels. "
+            "JPEG/TIFF output may fail or be unsupported at this size. "
+            "Please use a .png extension for --out."
+        )
+
+
 def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
     # Preflight inspection removed; only --inspect-only in main() will run inspect_directory(in_dir)
     paths = _list_images(in_dir)
@@ -1136,6 +1161,7 @@ def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
 
     canvas_w = int(math.ceil((max_x - min_x) / mpp))
     canvas_h = int(math.ceil((max_y - min_y) / mpp))
+    _ensure_output_dimension_limit(out_path, canvas_w, canvas_h)
 
     # Keep base as RGB to reduce memory usage (white background)
     base = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
@@ -1242,7 +1268,7 @@ def _warp_photo_to_canvas(
     y0 = (meta.lat_deg - origin_lat) * m_per_deg_lat
 
     # Tilt center shift (same as _project_corners)
-    alt_eff = float(meta.alt_m) - float(getattr(options, "lake_alt_m", 0.0))
+    alt_eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
     tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
     forward = alt_eff * math.tan(math.radians(tilt_deg))
     top_world = _yaw_to_top_world(meta.yaw_deg, options)
@@ -1389,10 +1415,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="PNG compress level (0-9). Used only when --out ends with .png (default: 6)",
     )
     ap.add_argument(
-        "--lake-alt",
+        "--alt-correction",
         type=float,
         default=0.0,
-        help="target surface altitude in meters; effective altitude is alt_m - lake_alt",
+        help="altitude correction in meters; effective altitude is Relative Altitude + alt_correction",
     )
     ap.add_argument(
         "--yaw-offset",
@@ -1447,6 +1473,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="launch GUI for interactive adjustment (requires PyQt6)",
     )
+    ap.add_argument(
+        "--preview-max-pix",
+        type=int,
+        default=2048,
+        help="GUI preview max width/height in pixels (default: 2048)",
+    )
     return ap.parse_args(argv)
 
 
@@ -1473,7 +1505,7 @@ def _warp_photo_to_canvas_from_rgba(
     x0 = (meta.lon_deg - origin_lon) * m_per_deg_lon
     y0 = (meta.lat_deg - origin_lat) * m_per_deg_lat
 
-    alt_eff = float(meta.alt_m) - float(getattr(options, "lake_alt_m", 0.0))
+    alt_eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
     tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
     forward = alt_eff * math.tan(math.radians(tilt_deg))
     top_world = _yaw_to_top_world(meta.yaw_deg, options)
@@ -1605,7 +1637,7 @@ class MosaicViewer(QtWidgets.QGraphicsView):
         
         self._pan_active = False
         self._pan_start = QtCore.QPoint()
-        self._layer_regions = []  # List of (bbox, filename) for hover detection
+        self._layer_regions = []  # List of (bbox, overlay_text) for hover detection
     
     def wheelEvent(self, event: QtGui.QWheelEvent):
         """Handle mouse wheel zoom."""
@@ -1632,10 +1664,10 @@ class MosaicViewer(QtWidgets.QGraphicsView):
             
             # Find topmost layer at this position
             found = None
-            for bbox, filename in reversed(self._layer_regions):  # Check from top to bottom
+            for bbox, overlay_text in reversed(self._layer_regions):  # Check from top to bottom
                 x0, y0, x1, y1 = bbox
                 if x0 <= x <= x1 and y0 <= y <= y1:
-                    found = filename
+                    found = overlay_text
                     break
             
             if found:
@@ -1683,7 +1715,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             self.yaw_mode = "default"
         
         # GUI-editable values (CLI-equivalent)
-        self.lake_alt_m_gui = float(getattr(options, "lake_alt_m", 0.0))
+        self.alt_correction_m_gui = float(getattr(options, "alt_correction_m", 0.0))
         self.yaw_offset_deg_gui = float(getattr(options, "yaw_offset_deg", 0.0))
 
         # Preview source cache: decoded+downscaled RGBA to avoid re-reading originals on every preview update
@@ -1702,11 +1734,12 @@ class MosaicGUI(QtWidgets.QMainWindow):
         )
         self.canvas_w = int(math.ceil((self.max_x - self.min_x) / self.mpp))
         self.canvas_h = int(math.ceil((self.max_y - self.min_y) / self.mpp))
+        _ensure_output_dimension_limit(self.out_path, self.canvas_w, self.canvas_h)
         
         sys.stderr.write(f"Canvas size: {self.canvas_w} x {self.canvas_h}\n")
         
         # Precompute preview scale and geometry (used to keep preview fast)
-        self._preview_max_dim = 2048
+        self._preview_max_dim = max(64, int(getattr(self.options, "preview_max_dim", 2048)))
         self._preview_scale = min(1.0, self._preview_max_dim / max(self.canvas_w, self.canvas_h))
         self._preview_w = int(self.canvas_w * self._preview_scale)
         self._preview_h = int(self.canvas_h * self._preview_scale)
@@ -1765,7 +1798,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
         return RenderOptions(
             undistort=self.options.undistort,
             k1=self.options.k1,
-            lake_alt_m=float(self.lake_alt_m_gui),
+            alt_correction_m=float(self.alt_correction_m_gui),
             yaw_offset_deg=float(self.yaw_offset_deg_gui),
             yaw_invert=self.yaw_invert,
             yaw_gimbal_only=(self.yaw_mode == "gimbal_only"),
@@ -1775,6 +1808,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             roi_margin_px=self.options.roi_margin_px,
             jpg_quality=self.options.jpg_quality,
             png_compress_level=self.options.png_compress_level,
+            preview_max_dim=int(getattr(self.options, "preview_max_dim", 2048)),
         )
     
     def _generate_preview(self, max_dim: int = 2048) -> Image.Image:
@@ -1805,6 +1839,8 @@ class MosaicGUI(QtWidgets.QMainWindow):
                 yaw_deg=meta.yaw_deg,
                 hfov_deg=meta.hfov_deg,
                 pitch_deg=meta.pitch_deg,
+                flight_pitch_deg=meta.flight_pitch_deg,
+                gimbal_pitch_deg=meta.gimbal_pitch_deg,
             )
 
             warped, offset = _warp_photo_to_canvas_from_rgba(
@@ -1838,7 +1874,23 @@ class MosaicGUI(QtWidgets.QMainWindow):
             if meta is None:
                 continue
             bbox = (offset[0], offset[1], offset[0] + warped.width, offset[1] + warped.height)
-            regions.append((bbox, os.path.basename(meta.path)))
+            fp = (
+                f"{float(meta.flight_pitch_deg):.2f}"
+                if getattr(meta, "flight_pitch_deg", None) is not None
+                else "N/A"
+            )
+            gp = (
+                f"{float(meta.gimbal_pitch_deg):.2f}"
+                if getattr(meta, "gimbal_pitch_deg", None) is not None
+                else "N/A"
+            )
+            overlay_text = (
+                f"{os.path.basename(meta.path)}\n"
+                f"Relative Altitude [m]: {float(meta.alt_m):.2f}\n"
+                f"Flight Pitch [degree]: {fp}\n"
+                f"Gimbal Pitch [degree]: {gp}"
+            )
+            regions.append((bbox, overlay_text))
         self.view._layer_regions = regions
 
         img = self.preview_image
@@ -1857,36 +1909,45 @@ class MosaicGUI(QtWidgets.QMainWindow):
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(panel)
 
-        # Lake altitude input (replaces Scale%)
-        lake_group = QtWidgets.QGroupBox("Altitude (m)")
+        # Altitude correction input
+        lake_group = QtWidgets.QGroupBox("Camera-Altitude Distance")
         lake_v = QtWidgets.QVBoxLayout()
         lake_h = QtWidgets.QHBoxLayout()
-        self.lake_alt_input = QtWidgets.QLineEdit(f"{self.lake_alt_m_gui:.2f}")
-        self.lake_alt_input.setMaximumWidth(90)
-        self.lake_alt_input.returnPressed.connect(self._on_lake_alt_input)
-        lake_h.addWidget(QtWidgets.QLabel("Lake altitude:"))
-        lake_h.addWidget(self.lake_alt_input)
+        self.alt_correction_input = QtWidgets.QLineEdit(f"{self.alt_correction_m_gui:.2f}")
+        self.alt_correction_input.setMaximumWidth(90)
+        self.alt_correction_input.returnPressed.connect(self._on_alt_correction_input)
+        lake_h.addWidget(QtWidgets.QLabel("Altitude Correction [m]:"))
+        lake_h.addWidget(self.alt_correction_input)
         lake_v.addLayout(lake_h)
 
-        try:
-            rel_avg = float(np.mean([float(m.alt_m) for m in self.metas]))
-        except Exception:
-            rel_avg = 0.0
-        rel_lbl = QtWidgets.QLabel(f"Avg Relative Altitude: {rel_avg:.2f} m")
-        rel_lbl.setStyleSheet("font-size: 9pt; color: #666;")
-        lake_v.addWidget(rel_lbl)
-        self.rel_alt_avg_label = rel_lbl
+        self.cam_water_avg_label = QtWidgets.QLabel("Avg. Camera-Water Distance: 0.00 m")
+        rel_stats_group = QtWidgets.QGroupBox("Relative Altitude (Exif) stats")
+        rel_stats_v = QtWidgets.QVBoxLayout()
+        self.rel_alt_avg_label = QtWidgets.QLabel("Avg: 0.00 m")
+        self.rel_alt_min_label = QtWidgets.QLabel("Min: 0.00 m")
+        self.rel_alt_max_label = QtWidgets.QLabel("Max: 0.00 m")
+        for lbl in (
+            self.rel_alt_avg_label,
+            self.rel_alt_min_label,
+            self.rel_alt_max_label,
+        ):
+            lbl.setStyleSheet("font-size: 9pt; color: #666;")
+            rel_stats_v.addWidget(lbl)
+        rel_stats_group.setLayout(rel_stats_v)
+        lake_v.addWidget(self.cam_water_avg_label)
+        self.cam_water_avg_label.setStyleSheet("font-size: 9pt; color: #666;")
+        lake_v.addWidget(rel_stats_group)
 
         lake_group.setLayout(lake_v)
         layout.addWidget(lake_group)
 
         # Yaw offset input
-        yawoff_group = QtWidgets.QGroupBox("Yaw offset (deg)")
+        yawoff_group = QtWidgets.QGroupBox("Rotation Correction")
         yawoff_layout = QtWidgets.QHBoxLayout()
         self.yaw_offset_input = QtWidgets.QLineEdit(f"{self.yaw_offset_deg_gui:.2f}")
         self.yaw_offset_input.setMaximumWidth(90)
         self.yaw_offset_input.returnPressed.connect(self._on_yaw_offset_input)
-        yawoff_layout.addWidget(QtWidgets.QLabel("Value:"))
+        yawoff_layout.addWidget(QtWidgets.QLabel("Degree:"))
         yawoff_layout.addWidget(self.yaw_offset_input)
         yawoff_group.setLayout(yawoff_layout)
         layout.addWidget(yawoff_group)
@@ -1933,6 +1994,13 @@ class MosaicGUI(QtWidgets.QMainWindow):
         self.yaw_invert_check.stateChanged.connect(self._on_yaw_invert_changed)
         yaw_layout.addWidget(self.yaw_invert_check)
 
+        yaw_desc = QtWidgets.QLabel(
+            "Flight Yaw Degree = Drone direction (Exif)\n"
+            "Gimbal Yaw Degree = Gimbal direction (Exif)"
+        )
+        yaw_desc.setStyleSheet("font-size: 9pt; color: #666;")
+        yaw_layout.addWidget(yaw_desc)
+
         yaw_group.setLayout(yaw_layout)
         layout.addWidget(yaw_group)
 
@@ -1940,8 +2008,8 @@ class MosaicGUI(QtWidgets.QMainWindow):
         help_group = QtWidgets.QGroupBox("Keyboard Shortcuts")
         help_layout = QtWidgets.QVBoxLayout()
         help_label = QtWidgets.QLabel(
-            "H: Lake altitude +0.2m\n"
-            "J: Lake altitude -0.2m\n"
+            "H: Altitude correction +0.2m\n"
+            "J: Altitude correction -0.2m\n"
             "K: Yaw offset +2°\n"
             "L: Yaw offset -2°"
         )
@@ -1961,7 +2029,31 @@ class MosaicGUI(QtWidgets.QMainWindow):
         
         layout.addStretch()
         
+        self._update_altitude_reference_labels()
         return panel
+
+    def _update_altitude_reference_labels(self) -> None:
+        try:
+            rel_vals = [float(m.alt_m) for m in self.metas]
+            rel_avg = float(np.mean(rel_vals))
+            rel_min = float(np.min(rel_vals))
+            rel_max = float(np.max(rel_vals))
+        except Exception:
+            rel_avg = 0.0
+            rel_min = 0.0
+            rel_max = 0.0
+
+        corr = float(self.alt_correction_m_gui)
+        cam_water_avg = rel_avg + corr
+
+        if hasattr(self, "cam_water_avg_label"):
+            self.cam_water_avg_label.setText(f"Avg. Camera-Water Distance: {cam_water_avg:.2f} m")
+        if hasattr(self, "rel_alt_avg_label"):
+            self.rel_alt_avg_label.setText(f"Avg: {rel_avg:.2f} m")
+        if hasattr(self, "rel_alt_min_label"):
+            self.rel_alt_min_label.setText(f"Min: {rel_min:.2f} m")
+        if hasattr(self, "rel_alt_max_label"):
+            self.rel_alt_max_label.setText(f"Max: {rel_max:.2f} m")
 
     def _refresh_metas_for_current_yaw(self) -> None:
         """Reload PhotoMeta list with current yaw rules.
@@ -1973,7 +2065,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
         if not self.metas:
             return
 
-        # Recompute canvas geometry (world extents may change slightly with yaw/lake-alt)
+        # Recompute canvas geometry (world extents may change slightly with yaw/alt-correction)
         current_opts = self._get_current_options()
         self.origin_lat, self.origin_lon, self.min_x, self.min_y, self.max_x, self.max_y, self.mpp = _compute_canvas(
             self.metas, current_opts
@@ -1982,19 +2074,13 @@ class MosaicGUI(QtWidgets.QMainWindow):
         self.canvas_h = int(math.ceil((self.max_y - self.min_y) / self.mpp))
 
         # Recompute preview geometry
-        self._preview_max_dim = 2048
+        self._preview_max_dim = max(64, int(getattr(self.options, "preview_max_dim", 2048)))
         self._preview_scale = min(1.0, self._preview_max_dim / max(self.canvas_w, self.canvas_h))
         self._preview_w = int(self.canvas_w * self._preview_scale)
         self._preview_h = int(self.canvas_h * self._preview_scale)
         self._preview_mpp = self.mpp / self._preview_scale
 
-        # Update reference label (avg relative altitude)
-        if hasattr(self, "rel_alt_avg_label"):
-            try:
-                rel_avg = float(np.mean([float(m.alt_m) for m in self.metas]))
-            except Exception:
-                rel_avg = 0.0
-            self.rel_alt_avg_label.setText(f"Avg Relative Altitude: {rel_avg:.2f} m")
+        self._update_altitude_reference_labels()
 
     def _on_yaw_mode_changed(self, index: int):
         """Handle yaw mode combo box change. Regenerate preview layers."""
@@ -2027,7 +2113,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
         """Recompute preview canvas geometry for current options.
 
         This prevents the preview mosaic from being implicitly clipped by an outdated
-        preview canvas size when lake_alt/yaw_offset changes.
+        preview canvas size when alt-correction/yaw-offset changes.
         """
         current_opts = self._get_current_options()
         self.origin_lat, self.origin_lon, self.min_x, self.min_y, self.max_x, self.max_y, self.mpp = _compute_canvas(
@@ -2036,7 +2122,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
         self.canvas_w = int(math.ceil((self.max_x - self.min_x) / self.mpp))
         self.canvas_h = int(math.ceil((self.max_y - self.min_y) / self.mpp))
 
-        self._preview_max_dim = 2048
+        self._preview_max_dim = max(64, int(getattr(self.options, "preview_max_dim", 2048)))
         self._preview_scale = min(1.0, self._preview_max_dim / max(self.canvas_w, self.canvas_h))
         self._preview_w = int(self.canvas_w * self._preview_scale)
         self._preview_h = int(self.canvas_h * self._preview_scale)
@@ -2074,12 +2160,13 @@ class MosaicGUI(QtWidgets.QMainWindow):
         self.view.fitInView(rect, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
 
     def _on_revert(self):
-        self.lake_alt_m_gui = float(self.options.lake_alt_m)
+        self.alt_correction_m_gui = float(self.options.alt_correction_m)
         self.yaw_offset_deg_gui = float(self.options.yaw_offset_deg)
-        if hasattr(self, "lake_alt_input"):
-            self.lake_alt_input.setText(f"{self.lake_alt_m_gui:.2f}")
+        if hasattr(self, "alt_correction_input"):
+            self.alt_correction_input.setText(f"{self.alt_correction_m_gui:.2f}")
         if hasattr(self, "yaw_offset_input"):
             self.yaw_offset_input.setText(f"{self.yaw_offset_deg_gui:.2f}")
+        self._update_altitude_reference_labels()
         self._regenerate_preview_only(auto_fit=True)
         self.statusBar().showMessage("Reverted to original")
 
@@ -2103,6 +2190,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             self.origin_lat, self.origin_lon, self.min_x, self.min_y, self.max_x, self.max_y, self.mpp = _compute_canvas(self.metas, save_opts)
             self.canvas_w = int(math.ceil((self.max_x - self.min_x) / self.mpp))
             self.canvas_h = int(math.ceil((self.max_y - self.min_y) / self.mpp))
+            _ensure_output_dimension_limit(self.out_path, self.canvas_w, self.canvas_h)
 
             base = Image.new("RGB", (self.canvas_w, self.canvas_h), (255, 255, 255))
             metas_sorted = sorted(self.metas, key=lambda m: _effective_alt_m(m, save_opts), reverse=True)
@@ -2154,13 +2242,15 @@ class MosaicGUI(QtWidgets.QMainWindow):
     def keyPressEvent(self, event: QtGui.QKeyEvent):
         key = event.key()
         if key == QtCore.Qt.Key.Key_H:
-            self.lake_alt_m_gui += 0.2
-            self.lake_alt_input.setText(f"{self.lake_alt_m_gui:.2f}")
+            self.alt_correction_m_gui += 0.2
+            self.alt_correction_input.setText(f"{self.alt_correction_m_gui:.2f}")
+            self._update_altitude_reference_labels()
             self._regenerate_preview_only(auto_fit=False)
             return
         if key == QtCore.Qt.Key.Key_J:
-            self.lake_alt_m_gui -= 0.2
-            self.lake_alt_input.setText(f"{self.lake_alt_m_gui:.2f}")
+            self.alt_correction_m_gui -= 0.2
+            self.alt_correction_input.setText(f"{self.alt_correction_m_gui:.2f}")
+            self._update_altitude_reference_labels()
             self._regenerate_preview_only(auto_fit=False)
             return
         if key == QtCore.Qt.Key.Key_K:
@@ -2211,15 +2301,16 @@ class MosaicGUI(QtWidgets.QMainWindow):
             self._pending_initial_fit = False
             QtCore.QTimer.singleShot(0, self._fit_view_to_scene)
 
-    def _on_lake_alt_input(self) -> None:
-        """Apply lake_alt (m) edit and refresh preview (from cached low-res sources)."""
+    def _on_alt_correction_input(self) -> None:
+        """Apply altitude correction edit and refresh preview (from cached low-res sources)."""
         try:
-            self.lake_alt_m_gui = float(self.lake_alt_input.text())
+            self.alt_correction_m_gui = float(self.alt_correction_input.text())
         except Exception:
-            self.lake_alt_input.setText(f"{self.lake_alt_m_gui:.2f}")
+            self.alt_correction_input.setText(f"{self.alt_correction_m_gui:.2f}")
             return
 
-        # lake_alt affects placement/scale => preview must be re-warped (but from cache)
+        # Altitude correction affects placement/scale => preview must be re-warped (but from cache)
+        self._update_altitude_reference_labels()
         self._regenerate_preview_only(auto_fit=False)
 
     def _on_yaw_offset_input(self) -> None:
@@ -2238,7 +2329,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
         self.options = RenderOptions(
             undistort=self.options.undistort,
             k1=self.options.k1,
-            lake_alt_m=float(self.lake_alt_m_gui),
+            alt_correction_m=float(self.alt_correction_m_gui),
             yaw_offset_deg=float(self.yaw_offset_deg_gui),
             yaw_invert=self.yaw_invert,
             yaw_gimbal_only=(self.yaw_mode == "gimbal_only"),
@@ -2248,6 +2339,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             roi_margin_px=self.options.roi_margin_px,
             jpg_quality=self.options.jpg_quality,
             png_compress_level=self.options.png_compress_level,
+            preview_max_dim=int(getattr(self.options, "preview_max_dim", 2048)),
         )
         if hasattr(self, "opacity_label"):
             self.opacity_label.setText(f"{int(value)}%")
@@ -2281,7 +2373,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             launch_gui(args.in_dir, args.out, RenderOptions(
                 undistort=bool(getattr(args, "undistort", False)),
                 k1=float(getattr(args, "k1", 0.0)),
-                lake_alt_m=float(getattr(args, "lake_alt", 0.0)),
+                alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
                 yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
                 yaw_invert=bool(getattr(args, "yaw_invert", False)),
                 yaw_gimbal_only=bool(getattr(args, "yaw_gimbal_only", False)),
@@ -2291,12 +2383,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                 roi_margin_px=int(getattr(args, "roi_margin", 8)),
                 jpg_quality=int(getattr(args, "jpg_quality", 95)),
                 png_compress_level=int(getattr(args, "png_compress_level", 6)),
+                preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
             ))
             return
         opts = RenderOptions(
             undistort=bool(getattr(args, "undistort", False)),
             k1=float(getattr(args, "k1", 0.0)),
-            lake_alt_m=float(getattr(args, "lake_alt", 0.0)),
+            alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
             yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
             yaw_invert=bool(getattr(args, "yaw_invert", False)),
             yaw_gimbal_only=bool(getattr(args, "yaw_gimbal_only", False)),
@@ -2306,6 +2399,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             roi_margin_px=int(getattr(args, "roi_margin", 8)),
             jpg_quality=int(getattr(args, "jpg_quality", 95)),
             png_compress_level=int(getattr(args, "png_compress_level", 6)),
+            preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
         )
         mosaic(args.in_dir, args.out, opts)
     finally:
