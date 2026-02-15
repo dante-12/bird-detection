@@ -58,7 +58,7 @@ except ImportError:
 Image.MAX_IMAGE_PIXELS = None
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
-MAX_JPG_TIF_DIM_PX = 65535
+MAX_JPG_TIF_DIM_PX = 64000
 
 # Metadata keys we expect to use (as seen by exifread)
 INSPECT_KEYS: Dict[str, Tuple[str, ...]] = {
@@ -93,9 +93,12 @@ class PhotoMeta:
     alt_m: float
     yaw_deg: float  # clockwise from true north
     hfov_deg: float
+    flight_yaw_deg: Optional[float] = None
+    gimbal_yaw_deg: Optional[float] = None
     pitch_deg: float = -90.0  # degrees; -90 is nadir
     flight_pitch_deg: Optional[float] = None
     gimbal_pitch_deg: Optional[float] = None
+    gimbal_roll_deg: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -517,6 +520,28 @@ def _extract_yaw(tags: Dict[str, object], options: Optional[RenderOptions] = Non
     return None
 
 
+def _extract_flight_yaw(tags: Dict[str, object]) -> Optional[float]:
+    return _extract_first_float(
+        tags,
+        (
+            "Flight Yaw Degree",
+            "XMP DJI:FlightYawDegree",
+            "XMP DJI:FlightYaw",
+        ),
+    )
+
+
+def _extract_gimbal_yaw(tags: Dict[str, object]) -> Optional[float]:
+    return _extract_first_float(
+        tags,
+        (
+            "Gimbal Yaw Degree",
+            "XMP DJI:GimbalYawDegree",
+            "XMP DJI:GimbalYaw",
+        ),
+    )
+
+
 def _extract_gimbal_pitch(tags: Dict[str, object]) -> Optional[float]:
     return _extract_first_float(
         tags,
@@ -624,8 +649,11 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
     lat, lon = _extract_lat_lon(tags)
     alt = _extract_alt(tags)
     yaw = _extract_yaw(tags, options)
+    flight_yaw = _extract_flight_yaw(tags)
+    gimbal_yaw = _extract_gimbal_yaw(tags)
     flight_pitch = _extract_flight_pitch(tags)
     gimbal_pitch = _extract_gimbal_pitch(tags)
+    gimbal_roll = _extract_gimbal_roll(tags)
 
     pitch = _extract_pitch(tags)
     if pitch is not None:
@@ -660,10 +688,13 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
         lon_deg=float(lon),
         alt_m=float(alt),
         yaw_deg=float(yaw) % 360.0,
+        flight_yaw_deg=float(flight_yaw) % 360.0 if flight_yaw is not None else None,
+        gimbal_yaw_deg=float(gimbal_yaw) % 360.0 if gimbal_yaw is not None else None,
         hfov_deg=float(hfov),
         pitch_deg=float(pitch) if pitch is not None else -90.0,
         flight_pitch_deg=float(flight_pitch) if flight_pitch is not None else None,
         gimbal_pitch_deg=float(gimbal_pitch) if gimbal_pitch is not None else None,
+        gimbal_roll_deg=float(gimbal_roll) if gimbal_roll is not None else None,
     )
 
 
@@ -1884,11 +1915,23 @@ class MosaicGUI(QtWidgets.QMainWindow):
                 if getattr(meta, "gimbal_pitch_deg", None) is not None
                 else "N/A"
             )
+            fy = (
+                f"{float(meta.flight_yaw_deg):.2f}"
+                if getattr(meta, "flight_yaw_deg", None) is not None
+                else "N/A"
+            )
+            gy = (
+                f"{float(meta.gimbal_yaw_deg):.2f}"
+                if getattr(meta, "gimbal_yaw_deg", None) is not None
+                else "N/A"
+            )
             overlay_text = (
                 f"{os.path.basename(meta.path)}\n"
                 f"Relative Altitude [m]: {float(meta.alt_m):.2f}\n"
                 f"Flight Pitch [degree]: {fp}\n"
-                f"Gimbal Pitch [degree]: {gp}"
+                f"Gimbal Pitch [degree]: {gp}\n"
+                f"Flight Yaw Degree: {fy}\n"
+                f"Gimbal Yaw Degree: {gy}"
             )
             regions.append((bbox, overlay_text))
         self.view._layer_regions = regions
@@ -1950,7 +1993,6 @@ class MosaicGUI(QtWidgets.QMainWindow):
         yawoff_layout.addWidget(QtWidgets.QLabel("Degree:"))
         yawoff_layout.addWidget(self.yaw_offset_input)
         yawoff_group.setLayout(yawoff_layout)
-        layout.addWidget(yawoff_group)
 
         # Opacity control
         opacity_group = QtWidgets.QGroupBox("Transparency (%)")
@@ -1965,7 +2007,18 @@ class MosaicGUI(QtWidgets.QMainWindow):
         opacity_layout.addWidget(self.opacity_slider)
         opacity_layout.addWidget(self.opacity_label)
         opacity_group.setLayout(opacity_layout)
-        layout.addWidget(opacity_group)
+
+        # Stack Rotation Correction and Transparency vertically.
+        # Keep full content visible by using natural minimum heights.
+        yawoff_group.setMinimumHeight(yawoff_group.sizeHint().height())
+        opacity_group.setMinimumHeight(opacity_group.sizeHint().height())
+        rot_opacity_stack = QtWidgets.QWidget()
+        rot_opacity_layout = QtWidgets.QVBoxLayout(rot_opacity_stack)
+        rot_opacity_layout.setContentsMargins(0, 0, 0, 0)
+        rot_opacity_layout.setSpacing(6)
+        rot_opacity_layout.addWidget(yawoff_group)
+        rot_opacity_layout.addWidget(opacity_group)
+        layout.addWidget(rot_opacity_stack)
 
         # Yaw mode control
         yaw_group = QtWidgets.QGroupBox("Image Rotation Rule")
@@ -2004,19 +2057,35 @@ class MosaicGUI(QtWidgets.QMainWindow):
         yaw_group.setLayout(yaw_layout)
         layout.addWidget(yaw_group)
 
-        # Keyboard shortcuts help
+        # Keyboard shortcuts help + Exif stats
         help_group = QtWidgets.QGroupBox("Keyboard Shortcuts")
         help_layout = QtWidgets.QVBoxLayout()
         help_label = QtWidgets.QLabel(
-            "H: Altitude correction +0.2m\n"
-            "J: Altitude correction -0.2m\n"
-            "K: Yaw offset +2°\n"
-            "L: Yaw offset -2°"
+            "H: Altitude +0.2m\n"
+            "J: Altitude -0.2m\n"
+            "K: Rotation +2°\n"
+            "L: Rotation -2°"
         )
         help_label.setStyleSheet("font-size: 9pt;")
         help_layout.addWidget(help_label)
         help_group.setLayout(help_layout)
-        layout.addWidget(help_group)
+        # Keep full shortcut text visible.
+        help_group.setMinimumHeight(help_group.sizeHint().height())
+
+        exif_group = QtWidgets.QGroupBox("Exif Info")
+        exif_layout = QtWidgets.QVBoxLayout()
+        self.exif_stats_label = QtWidgets.QLabel("")
+        self.exif_stats_label.setStyleSheet("font-size: 9pt; color: #666;")
+        exif_layout.addWidget(self.exif_stats_label)
+        exif_group.setLayout(exif_layout)
+
+        info_stack = QtWidgets.QWidget()
+        info_stack_layout = QtWidgets.QVBoxLayout(info_stack)
+        info_stack_layout.setContentsMargins(0, 0, 0, 0)
+        info_stack_layout.setSpacing(6)
+        info_stack_layout.addWidget(help_group)
+        info_stack_layout.addWidget(exif_group)
+        layout.addWidget(info_stack)
 
         # Buttons
         btn_revert = QtWidgets.QPushButton("Revert")
@@ -2030,6 +2099,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
         layout.addStretch()
         
         self._update_altitude_reference_labels()
+        self._update_exif_stats_label()
         return panel
 
     def _update_altitude_reference_labels(self) -> None:
@@ -2054,6 +2124,35 @@ class MosaicGUI(QtWidgets.QMainWindow):
             self.rel_alt_min_label.setText(f"Min: {rel_min:.2f} m")
         if hasattr(self, "rel_alt_max_label"):
             self.rel_alt_max_label.setText(f"Max: {rel_max:.2f} m")
+
+    def _update_exif_stats_label(self) -> None:
+        if not hasattr(self, "exif_stats_label"):
+            return
+        if not self.metas:
+            self.exif_stats_label.setText("No EXIF stats available")
+            return
+
+        def _stats(values: List[Optional[float]]) -> str:
+            nums = [float(v) for v in values if v is not None]
+            if not nums:
+                return "N/A"
+            return f"avg={float(np.mean(nums)):.2f}, min={float(np.min(nums)):.2f}, max={float(np.max(nums)):.2f}"
+
+        fov_vals = [float(m.hfov_deg) for m in self.metas]
+        fov_avg = float(np.mean(fov_vals))
+        fov_min = float(np.min(fov_vals))
+        fov_max = float(np.max(fov_vals))
+        if (fov_max - fov_min) <= 1e-3:
+            fov_line = f"FOV [deg]: {fov_avg:.2f} (uniform)"
+        else:
+            fov_line = f"FOV [deg]: mismatch detected (avg={fov_avg:.2f}, min={fov_min:.2f}, max={fov_max:.2f})"
+
+        fp_line = "Flight Pitch [deg]: " + _stats([getattr(m, "flight_pitch_deg", None) for m in self.metas])
+        gp_line = "Gimbal Pitch [deg]: " + _stats([getattr(m, "gimbal_pitch_deg", None) for m in self.metas])
+        gr_line = "Gimbal Roll [deg]: " + _stats([getattr(m, "gimbal_roll_deg", None) for m in self.metas])
+        fy_line = "Flight Yaw [deg]: " + _stats([getattr(m, "flight_yaw_deg", None) for m in self.metas])
+        gy_line = "Gimbal Yaw [deg]: " + _stats([getattr(m, "gimbal_yaw_deg", None) for m in self.metas])
+        self.exif_stats_label.setText("\n".join([fov_line, fp_line, gp_line, gr_line, fy_line, gy_line]))
 
     def _refresh_metas_for_current_yaw(self) -> None:
         """Reload PhotoMeta list with current yaw rules.
@@ -2081,6 +2180,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
         self._preview_mpp = self.mpp / self._preview_scale
 
         self._update_altitude_reference_labels()
+        self._update_exif_stats_label()
 
     def _on_yaw_mode_changed(self, index: int):
         """Handle yaw mode combo box change. Regenerate preview layers."""
