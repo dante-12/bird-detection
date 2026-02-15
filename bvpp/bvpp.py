@@ -1910,7 +1910,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
         layout = QtWidgets.QHBoxLayout(panel)
 
         # Altitude correction input
-        lake_group = QtWidgets.QGroupBox("Camera-Altitude Distance")
+        lake_group = QtWidgets.QGroupBox("Camera-Water Distance")
         lake_v = QtWidgets.QVBoxLayout()
         lake_h = QtWidgets.QHBoxLayout()
         self.alt_correction_input = QtWidgets.QLineEdit(f"{self.alt_correction_m_gui:.2f}")

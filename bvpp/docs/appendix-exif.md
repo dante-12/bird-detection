@@ -4,14 +4,14 @@
     * GPS Longitude
 
 ## ドローンの高度
-    * Relative Altitude - 不正確な場合があるため`--lake-alt`で補正が必要
+    * Relative Altitude - 不正確な場合が多いため`--alt-correction`で補正が必要
 
 ## ドローンとカメラの向き
     * Flight Yaw Degree
     * Gimbal Yaw Degree
-    * Flight Pitch Degree - 読み込んではいるが未使用。
-    * Gimbal Pitch Degree - カメラは真下を向いていることを想定。-90度前後の値であることを期待。inspect-onlyモードでのみ仕様。
+    * Flight Pitch Degree - ドローンの水平からのズレ。ほぼ0（水平）であるべき。0でない場合、カメラが直下を向いていないことを意味する。
+    * Gimbal Pitch Degree - カメラは真下を向いていることを想定。-90度前後の値であることを期待。
     * Gimbal Roll Degree - inspect-onlyモードでのみ、確認に使用。0度かnullであるべき。
 
 ## カメラの画角
-    * Field Of View
+    * Field Of View - Exifのこの値が合っているのかどうか、正直疑問です
