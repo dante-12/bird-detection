@@ -108,6 +108,7 @@ class RenderOptions:
     alt_correction_m: float = 0.0  # effective altitude = Relative Altitude + alt_correction_m
     yaw_offset_deg: float = 0.0  # additional yaw correction (degrees, clockwise from north)
     yaw_invert: bool = False  # if True, use -yaw (legacy behavior)
+    yaw_both: bool = False  # if True, yaw = Flight Yaw Degree + Gimbal Yaw Degree
     yaw_gimbal_only: bool = False  # if True, ignore Flight Yaw Degree and use only Gimbal Yaw Degree
     yaw_flight_only: bool = False  # if True, ignore Gimbal Yaw Degree and use only Flight Yaw Degree
     opacity_pct: float = 100.0  # 0-100; applies to all warped layers before compositing
@@ -467,10 +468,11 @@ def _extract_alt(tags: Dict[str, object]) -> Optional[float]:
 def _extract_yaw(tags: Dict[str, object], options: Optional[RenderOptions] = None) -> Optional[float]:
     """Extract yaw in degrees (clockwise from true north).
 
-    Default behavior: yaw = flight_yaw + gimbal_yaw.
+    Default behavior: yaw = flight_yaw.
+    If options.yaw_both is True: yaw = flight_yaw + gimbal_yaw.
     If options.yaw_gimbal_only is True: yaw = gimbal_yaw.
     If options.yaw_flight_only is True: yaw = flight_yaw.
-    (flight_only takes precedence over gimbal_only if both are set)
+    Precedence: gimbal_only > yaw_both > flight_only/default.
     """
     gimbal = _extract_first_float(
         tags,
@@ -490,15 +492,24 @@ def _extract_yaw(tags: Dict[str, object], options: Optional[RenderOptions] = Non
         ),
     )
 
-    if options is not None and bool(getattr(options, "yaw_flight_only", False)):
-        if flight is not None:
-            return float(flight) % 360.0
-        return None
-
     if options is not None and bool(getattr(options, "yaw_gimbal_only", False)):
         if gimbal is not None:
             return float(gimbal) % 360.0
         return None
+
+    if options is not None and bool(getattr(options, "yaw_both", False)):
+        if flight is not None or gimbal is not None:
+            yaw = float(flight or 0.0) + float(gimbal or 0.0)
+            return yaw % 360.0
+        return None
+
+    # Default and --yaw-flight-only resolve to the same behavior.
+    if flight is not None:
+        return float(flight) % 360.0
+
+    # If flight yaw is unavailable, fall back to gimbal yaw before generic fallback.
+    if gimbal is not None:
+        return float(gimbal) % 360.0
 
     if flight is not None or gimbal is not None:
         yaw = float(flight or 0.0) + float(gimbal or 0.0)
@@ -1495,9 +1506,14 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="use only Gimbal Yaw Degree for yaw (ignore Flight Yaw Degree)",
     )
     ap.add_argument(
+        "--yaw-both",
+        action="store_true",
+        help="use Flight Yaw Degree + Gimbal Yaw Degree for yaw",
+    )
+    ap.add_argument(
         "--yaw-flight-only",
         action="store_true",
-        help="use only Flight Yaw Degree for yaw (ignore Gimbal Yaw Degree)",
+        help="use only Flight Yaw Degree for yaw (default behavior)",
     )
     ap.add_argument(
         "--gui",
@@ -1734,16 +1750,17 @@ class MosaicGUI(QtWidgets.QMainWindow):
         self.preview_opacity = 100.0
         
         # Yaw settings (mutable copy for GUI adjustments)
-        self.yaw_mode = "default"  # "default", "flight_only", "gimbal_only"
+        self.yaw_mode = "flight_only"  # "both", "flight_only", "gimbal_only"
         self.yaw_invert = bool(getattr(options, "yaw_invert", False))
         
         # Set initial yaw mode from options
-        if bool(getattr(options, "yaw_flight_only", False)):
-            self.yaw_mode = "flight_only"
-        elif bool(getattr(options, "yaw_gimbal_only", False)):
+        if bool(getattr(options, "yaw_gimbal_only", False)):
             self.yaw_mode = "gimbal_only"
+        elif bool(getattr(options, "yaw_both", False)):
+            self.yaw_mode = "both"
         else:
-            self.yaw_mode = "default"
+            # Default behavior is flight-only.
+            self.yaw_mode = "flight_only"
         
         # GUI-editable values (CLI-equivalent)
         self.alt_correction_m_gui = float(getattr(options, "alt_correction_m", 0.0))
@@ -1832,6 +1849,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             alt_correction_m=float(self.alt_correction_m_gui),
             yaw_offset_deg=float(self.yaw_offset_deg_gui),
             yaw_invert=self.yaw_invert,
+            yaw_both=(self.yaw_mode == "both"),
             yaw_gimbal_only=(self.yaw_mode == "gimbal_only"),
             yaw_flight_only=(self.yaw_mode == "flight_only"),
             opacity_pct=self.options.opacity_pct,
@@ -2186,7 +2204,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
         """Handle yaw mode combo box change. Regenerate preview layers."""
         old_mode = self.yaw_mode
         if index == 0:
-            self.yaw_mode = "default"
+            self.yaw_mode = "both"
         elif index == 1:
             self.yaw_mode = "flight_only"
         elif index == 2:
@@ -2432,6 +2450,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             alt_correction_m=float(self.alt_correction_m_gui),
             yaw_offset_deg=float(self.yaw_offset_deg_gui),
             yaw_invert=self.yaw_invert,
+            yaw_both=(self.yaw_mode == "both"),
             yaw_gimbal_only=(self.yaw_mode == "gimbal_only"),
             yaw_flight_only=(self.yaw_mode == "flight_only"),
             opacity_pct=float(value),
@@ -2476,6 +2495,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
                 yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
                 yaw_invert=bool(getattr(args, "yaw_invert", False)),
+                yaw_both=bool(getattr(args, "yaw_both", False)),
                 yaw_gimbal_only=bool(getattr(args, "yaw_gimbal_only", False)),
                 yaw_flight_only=bool(getattr(args, "yaw_flight_only", False)),
                 opacity_pct=float(getattr(args, "opacity", 100.0)),
@@ -2492,6 +2512,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
             yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
             yaw_invert=bool(getattr(args, "yaw_invert", False)),
+            yaw_both=bool(getattr(args, "yaw_both", False)),
             yaw_gimbal_only=bool(getattr(args, "yaw_gimbal_only", False)),
             yaw_flight_only=bool(getattr(args, "yaw_flight_only", False)),
             opacity_pct=float(getattr(args, "opacity", 100.0)),
