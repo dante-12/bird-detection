@@ -60,14 +60,14 @@ RAMが16GB程度のWSL2/Ubuntu環境の場合は、次の状況でした。仮�
 
     ```
     $ cd bvpp
-    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --alt-correction 2.5 --yaw-flight-only
+    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --alt-correction 2.5
     ```
 
     実行後、保存した画像（この例では`numa-00.jpg`）をチェックして意図通りの合成になっているか確認する。なっていればここで完了です。
     
     何かが大きくズレているなら、おそらく各画像の回転角度が誤っているか、拡大縮小率（--alt-correction [m]値とExifのRelative Altitude [m]から逆算したカメラから被写体までの距離による）が誤っていると思われます。`--gui`オプションをつけて起動して、試行錯誤してみてください。キーボードからの操作で拡大縮小や回転が行えます。GUIの動きは遅いのでキーを押したら画面が更新されるまで待ち、連打はしないでください。
     ```
-    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --alt-correction 2.5 --yaw-flight-only --gui
+    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --alt-correction 2.5 --gui
     ```
 
     GUI上で、あるべきパラメータが絞れたら、そのまま`Save`ボタンで保存しましょう。GUIに表示されているAltitude CorrectionやRotation Correctionの数字を覚えておけば、次回以降はコマンドラインオプションからの直接指定で、GUIなしで保存することもできます。
@@ -92,9 +92,10 @@ RAMが16GB程度のWSL2/Ubuntu環境の場合は、次の状況でした。仮�
     この値とExifのRelative Altitude（ドローンの出発点からの飛翔高度）を足して、カメラから対象までの距離とみなす。マイナス値も可。Relative Altitudeの値は正確ではない場合がありますし、出発地点の高度と湖面の高さが一致していない場合もあるので、このオプションで微調整する。QGIS Vertical Photo Placerを使えば推定できるが、分からない場合は0とし、GUIから調整すべし。
 
 ## ドローンとカメラの水平方向の向きの解釈方法
-    * オプションをつけない場合はExifのFlight Yaw Degree（ドローン機体の水平方向の向き）とGimbal Yaw Degree（カメラの水平方向の向き）を足した角度だけ画像を回転させる
+    * オプションをつけない場合はExifのFlight Yaw Degree（ドローン機体の水平方向の向きの値）とGimbal Yaw Degree（カメラの水平方向の向きの値）を足した角度だけ画像を回転させる
+    * --yaw-flight-only : Flight Yaw Degreeだけ画像を回転させる。デフォルト値。最初はこれで試してください。
     * --yaw-gimbal-only : Gimbal Yaw Degreeだけ画像を回転させる
-    * --yaw-flight-only : Flight Yaw Degreeだけ画像を回転させる。推奨値。最初はこれを試してみてください。
+    * --yaw-both : Flight Yaw + Gimbal Yaw Degreeだけ画像を回転させる。
     * --yaw-invert : Yaw Degreeは北方向から時計回りに数えるが、このオプションが指定されると反時計回りと見なす
     * --yaw-offset 角度 : 指定した角度だけ時計回りに画像を回転させる
 

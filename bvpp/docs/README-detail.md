@@ -8,12 +8,11 @@
 2. 対象の画像に必要なExifのデータが含まれているか確認  
     次のコマンドを実行して、モザイク合成に使用する画像が意図したExif情報を持っているか、Gimbal Pitch/Rollの値が想定内か確認する。
     ```
-    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --alt-correction 2.5 --yaw-flight-only --inspect-only
+    $ python3 bvpp.py --in "./numa/" --out numa-00.png --alt-correction 2.5 --inspect-only
     ```
     * `--in` 処理する画像ファイルの入ったディレクトリ名。必ず""でくくること。
     * `--out` モザイク合成した画像を保存する先。
     * `--alt-correction` 1で調べた高度の補正値。よく分からなければ0で良い。
-    * `--yaw-flight-only` 画像合成する際の回転角度にExifのFlight Yaw Degree（機体の水平方向の向き）だけを使う指定
     * `--inspect-only` 処理する画像ファイルのExif情報を精査して、その後何もせずプログラムを終了する
 
     次の出力例の通り全項目について`=OK`が出ていれば問題なし。rollのみOKではなく`=-`となるかも。それはそれでよし。お使いのドローンがDJI製ならここで問題が出ることはないはず。
@@ -31,10 +30,10 @@
 3. 最初の実行
 
     ```
-    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --alt-correction 2.5 --yaw-flight-only
+    $ python3 bvpp.py --in "./numa/" --out numa-00.png --alt-correction 2.5
     ```
 
-    実行後、この例では`numa-00.jpg`をチェックして意図通りの合成になっているか確認する。なっていればここで完了です。何かが大きくズレているなら、これ以降のステップに進む。
+    実行後、この例では`numa-00.png`をチェックして意図通りの合成になっているか確認する。なっていればここで完了です。何かが大きくズレているなら、これ以降のステップに進む。
 
 4. 最初の実行でうまくいかなかったらGUIを起動して試行錯誤を行う
 
@@ -45,9 +44,9 @@
 
     このような場合はGUIを起動して試行錯誤してみましょう。`--gui`オプションをつけて起動してください。
     ```
-    $ python3 bvpp.py --in "./numa/" --out numa-00.jpg --alt-correction 2.5 --yaw-flight-only --gui
+    $ python3 bvpp.py --in "./numa/" --out numa-00.png --alt-correction 2.5 --gui
     ```
-    すると、新たなウィンドウが開かれてGUI画面表示されます。
+    すると、新たなウィンドウが開かれてGUI画面表示されます。ウィンドウ内をマウスでドラッグしたりスクロールホイールを回すことで、画像を動かしたり、拡大縮小できます。
 
     画像のサイズや回転角が合わない場合は、キーボードから手動で変更できます。ウィンドウに書かれた次の表記の通り、四種類の操作が出来ます。
 
@@ -58,19 +57,21 @@
     <img src="move.gif">
 
     
-    回転角度をExif値から調整するアルゴリズムを変更したい場合は、ウィンドウ下部にある以下のメニューを使います。
+    回転角度をExif値から調整するアルゴリズムを変更したい場合は、ウィンドウ下部にある以下のメニューを使います。デフォルトではFlight Yaw Degree（ドローンの水平方向の向きの値）の値だけに基づいて画像を回転させています。
 
     <img src="image_rotation_rule.png" alt="Image Rotation Rule">
 
     ここから色々組み合わせを選んでみて（全6通り）、意図した角度になる組み合わせを見つけてください。意味は次の通りです。DJIドローンの場合、たいていは"Use Flight Yaw Degree"（機体の水平方向の向きの値だけ使う）が正解だと思われますが、ドローンの設定によってはそうではない場合があるため、この機能を設けました。
-    * Use Flight + Gimbal Yaw Degree - Flight Yaw（ドローンの水平方向の向き）とGimbal Yaw（カメラの水平方向の向き）を足した角度だけ回転させる
-    * Use Gimbal Yaw Degree - Gimbal Yaw（カメラの水平方向の向き）の角度だけ回転させる
-    * Use Flight Yaw Degree - Flight Yaw（ドローンの水平方向の向き）の角度だけ回転させる
+    * Use Flight + Gimbal Yaw Degree [`--yaw-both`] - Flight Yaw（ドローンの水平方向の向き）とGimbal Yaw（カメラの水平方向の向き）を足した角度だけ回転させる
+    * Use Gimbal Yaw Degree [`--yaw-gimbal-only`] - Gimbal Yaw（カメラの水平方向の向き）の角度だけ回転させる
+    * Use Flight Yaw Degree [`--yaw-flight-only`]（規定値）- Flight Yaw（ドローンの水平方向の向き）の角度だけ回転させる
     * Reverse rotate - チェックすると上記の角度分だけ逆回転させる
+
+5. プレビュー画像をもっと精細にしたい場合
 
     Preview画像は、高速化のため解像度を低くしてあります（一片の最大値2,048ピクセル）。もっと解像度を上げたい場合は、起動時のCLIで`--preview-max-pix 4096`等と指定すると、その分解像度が上がります。その数字を大きくしすぎると、GUIの拡大縮小回転が極端に遅くなるので注意してください。
 
-5. 調整結果を保存する
+6. 調整結果を保存する
 
     気に入ったところで`Save`ボタンを押して保存してください。ここでメモリー不足で強制終了してしまうことがありますが、その場合はメモリーを増やしていただくしかありません。現状では。
 
