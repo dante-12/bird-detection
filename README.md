@@ -12,8 +12,8 @@ git clone https://github.com/dante-12/bird-detection.git
 次に実行に必要なツールやライブラリをインストールする。Ubuntuの場合は以下の通り。macOSだと一行目は`sudo apt ...`の代わりに`brew install ...`など。
 
 ```
-sudo apt install -y exiftool libxcb-cursor0
-pip install pillow numpy exifread PyQt6 ultralytics sahi
+sudo apt install -y exiftool libxcb-cursor0 libvips
+pip install pillow numpy exifread PyQt6 ultralytics sahi PySide6 pyvips
 ```
 
 <br><br>
@@ -26,6 +26,10 @@ pip install pillow numpy exifread PyQt6 ultralytics sahi
 * <a href="sliced-yolo-detect/README.md">Sliced Yolo Detection</a>
 
     沼の写真をモザイク合成した巨大な画像からYOLOを使って鳥を検出するためのプログラムです。内部的には<a href="https://github.com/obss/sahi">SAHI</a>を使って画像を分割、YOLOで検出し、結果に基づいて、元の画像に様々な条件でラベリングを行います。
+
+* <a href="yolo-label-reassembler/README.md">YOLO Label Reassembler</a>
+
+    Sliced Yolo Detectで検出を行った画像とデータから、YOLOモデルの再学習に使うデータを取り出すためのプログラムです。単に巨大な画像を見るためのツールとしても使えます。
 
 <br><br>
 
