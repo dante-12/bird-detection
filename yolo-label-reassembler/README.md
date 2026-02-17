@@ -55,7 +55,7 @@ pip install PySide6 pyvips
 1. 準備
     * sliced-yolo-detectで出力したラベリング済み画像のファイル名。以下、仮に`inba1_detect.png`とする。
     * sliced-yolo-detectで使用した元画像のファイル名。以下、仮に`inba1.png`とする。巨大画像を見るためだけに使う場合は不要。
-    * sliced-yolo-detectで出力したCSVファイル名。以下、仮に`inba1.csv`とする。巨大画像を見るためだけに使う場合は不要。
+    * sliced-yolo-detectで出力したCSVファイル名。以下、仮に`inba1.csv`とする。sliced-yolo-detect実行時に`--csv inba1.csv`と指定すると出力される。巨大画像を見るためだけに使う場合は不要。
     * (Optional) labelImgの画像フォルダへのパス。以下、仮に`/mnt/e/ylr/images/train`とする。指定しなければカレントディレクトリへ保存される。
     * (Optional) labelImgのラベルフォルダへのパス。以下、仮に`/mnt/e/ylr/labels/train`とする。指定しなければカレントディレクトリへ保存される。
 
