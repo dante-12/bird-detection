@@ -14,7 +14,7 @@ bvppという名称は、天体写真のモザイク合成に使われるAstro P
 * モザイク合成に厳密な精度を求めない場合
 * 個々の画像を別個に手動で拡大縮小・回転する必要がない場合
 
-細かい調整が必要な場合はVirtical Photo PlacerやMicrosoft ICEを使った方が良いです。ジンバルが安定していなかったり、ドローンの高度が地上に近かったりすると、このスクリプトでは、なかなかうまく合成できないようです。
+細かい調整が必要な場合はQGISの<a href="https://verticalphotoplacer.github.io/VerticalPhotoPlacer/">Vertical Photo Placer</a>やMicrosoft ICEを使った方が良いです。ジンバルが安定していなかったり、ドローンの高度が地上に近かったりすると、このスクリプトでは、なかなかうまく合成できないようです。
 
 ## 動作環境と制限
 * Windows 11/WSL2/Ubuntu/Python 3.9.13でテストしました。Google Colabでも実行できます（GUIはColabでは動きません）。OS依存性があるのは以下の点だけだと認識しています。
