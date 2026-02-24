@@ -69,6 +69,7 @@ INSPECT_KEYS: Dict[str, Tuple[str, ...]] = {
     "gimbal_yaw": ("Gimbal Yaw Degree", "XMP DJI:GimbalYawDegree", "XMP DJI:GimbalYaw"),
     "gimbal_pitch": ("Gimbal Pitch Degree", "XMP DJI:GimbalPitchDegree", "XMP DJI:GimbalPitch"),
     "flight_pitch": ("Flight Pitch Degree", "XMP DJI:FlightPitchDegree", "XMP DJI:FlightPitch"),
+    "flight_roll": ("Flight Roll Degree", "XMP DJI:FlightRollDegree", "XMP DJI:FlightRoll"),
     "fov": (
         "XMP Camera:FieldOfView",
         "XMP DJI:CameraFOV",
@@ -99,6 +100,9 @@ class PhotoMeta:
     flight_pitch_deg: Optional[float] = None
     gimbal_pitch_deg: Optional[float] = None
     gimbal_roll_deg: Optional[float] = None
+    flight_roll_deg: Optional[float] = None
+    product_name: Optional[str] = None
+    unique_camera_model: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -117,14 +121,17 @@ class RenderOptions:
     jpg_quality: int = 95  # JPEG quality (1-95 typical)
     png_compress_level: int = 6  # PNG compress_level (0-9)
     preview_max_dim: int = 2048  # GUI preview max width/height in pixels
+    use_pitch: bool = False  # if True, use pitch_deg in geometry (tilt shift / cos correction)
 
 
 def _effective_alt_m(meta: PhotoMeta, options: RenderOptions) -> float:
     # camera-to-target shortest distance approximation (includes altitude correction)
     eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
     # If camera is tilted, effective vertical height to the plane is eff*cos(tilt)
-    tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
-    eff = eff * max(math.cos(math.radians(tilt_deg)), 0.01)
+    # Apply this correction only when use_pitch is set
+    if bool(getattr(options, "use_pitch", False)):
+        tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
+        eff = eff * max(math.cos(math.radians(tilt_deg)), 0.01)
     return max(eff, 0.01)
 
 
@@ -215,6 +222,24 @@ def _extract_first_float(tags: Dict[str, object], keys: Iterable[str]) -> Option
         v = _try_parse_float(tags.get(k2))
         if v is not None:
             return float(v)
+
+    return None
+
+
+def _extract_first_text(tags: Dict[str, object], keys: Iterable[str]) -> Optional[str]:
+    # exact first
+    for k in keys:
+        if k in tags:
+            s = str(tags.get(k)).strip()
+            if s:
+                return s
+
+    # fuzzy fallback (namespace/key variations)
+    k2 = _find_tag_key(tags, keys)
+    if k2 is not None:
+        s = str(tags.get(k2)).strip()
+        if s:
+            return s
 
     return None
 
@@ -315,6 +340,15 @@ def _read_exiftool_json(path: str) -> Dict[str, object]:
     if v is not None:
         out["Flight Pitch Degree"] = v
 
+    v = _first(
+        "XMP-drone-dji:FlightRollDegree",
+        "XMP-drone-dji:FlightRollDegree#",
+        "XMP:FlightRollDegree",
+        "FlightRollDegree",
+    )
+    if v is not None:
+        out["Flight Roll Degree"] = v
+
     # Altitude
     v = _first(
         "XMP:RelativeAltitude",
@@ -345,6 +379,20 @@ def _read_exiftool_json(path: str) -> Dict[str, object]:
     v = _first("XMP:DiagonalFOV", "XMP-camera:DiagonalFOV", "DiagonalFOV")
     if v is not None:
         out["XMP Camera:DiagonalFOV"] = v
+
+    v = _first("XMP-drone-dji:ProductName", "XMP:ProductName", "ProductName", "Product Name")
+    if v is not None:
+        out["Product Name"] = v
+
+    v = _first(
+        "XMP-exifEX:UniqueCameraModel",
+        "XMP-exif:UniqueCameraModel",
+        "EXIF:UniqueCameraModel",
+        "UniqueCameraModel",
+        "Unique Camera Model",
+    )
+    if v is not None:
+        out["Unique Camera Model"] = v
 
     return out
 
@@ -586,6 +634,17 @@ def _extract_flight_pitch(tags: Dict[str, object]) -> Optional[float]:
     )
 
 
+def _extract_flight_roll(tags: Dict[str, object]) -> Optional[float]:
+    return _extract_first_float(
+        tags,
+        (
+            "Flight Roll Degree",
+            "XMP DJI:FlightRollDegree",
+            "XMP DJI:FlightRoll",
+        ),
+    )
+
+
 def _extract_pitch(tags: Dict[str, object]) -> Optional[float]:
     """Combine flight + gimbal pitch when present.
 
@@ -663,8 +722,25 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
     flight_yaw = _extract_flight_yaw(tags)
     gimbal_yaw = _extract_gimbal_yaw(tags)
     flight_pitch = _extract_flight_pitch(tags)
+    flight_roll = _extract_flight_roll(tags)
     gimbal_pitch = _extract_gimbal_pitch(tags)
     gimbal_roll = _extract_gimbal_roll(tags)
+    product_name = _extract_first_text(
+        tags,
+        (
+            "Product Name",
+            "XMP DJI:ProductName",
+            "ProductName",
+        ),
+    )
+    unique_camera_model = _extract_first_text(
+        tags,
+        (
+            "Unique Camera Model",
+            "EXIF UniqueCameraModel",
+            "UniqueCameraModel",
+        ),
+    )
 
     pitch = _extract_pitch(tags)
     if pitch is not None:
@@ -706,6 +782,9 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
         flight_pitch_deg=float(flight_pitch) if flight_pitch is not None else None,
         gimbal_pitch_deg=float(gimbal_pitch) if gimbal_pitch is not None else None,
         gimbal_roll_deg=float(gimbal_roll) if gimbal_roll is not None else None,
+        flight_roll_deg=float(flight_roll) if flight_roll is not None else None,
+        product_name=product_name,
+        unique_camera_model=unique_camera_model,
     )
 
 
@@ -781,7 +860,8 @@ def _project_corners(meta: PhotoMeta, origin_lat: float, origin_lon: float, opti
 
     # If camera is tilted, shift ground intersection of image center forward.
     # Approx: forward displacement = alt * tan(tilt)
-    if options is not None:
+    # Apply this shift only when use_pitch is set
+    if options is not None and bool(getattr(options, "use_pitch", False)):
         alt_eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
         tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
         forward = alt_eff * math.tan(math.radians(tilt_deg))
@@ -1117,24 +1197,63 @@ def _alpha_blend_rgba_over_rgb_inplace(base_rgb: Image.Image, over_rgba: Image.I
     base_rgb.paste(Image.fromarray(out_u8, mode="RGB"), (bx0, by0))
 
 
-def _save_image_with_options(img_rgb: Image.Image, out_path: str, options: RenderOptions) -> None:
-    """Save RGB image with format-specific options based on file extension."""
+def _alpha_blend_rgba_over_rgba_inplace(base_rgba: Image.Image, over_rgba: Image.Image, dest: Tuple[int, int]) -> None:
+    """Alpha-composite an RGBA ROI over an RGBA base image in-place."""
+    if base_rgba.mode != "RGBA":
+        raise ValueError("base_rgba must be RGBA")
+    if over_rgba.mode != "RGBA":
+        over_rgba = over_rgba.convert("RGBA")
+
+    x, y = int(dest[0]), int(dest[1])
+    if over_rgba.width <= 0 or over_rgba.height <= 0:
+        return
+
+    bx0 = max(0, x)
+    by0 = max(0, y)
+    bx1 = min(base_rgba.width, x + over_rgba.width)
+    by1 = min(base_rgba.height, y + over_rgba.height)
+    if bx1 <= bx0 or by1 <= by0:
+        return
+
+    ox0 = bx0 - x
+    oy0 = by0 - y
+    ox1 = ox0 + (bx1 - bx0)
+    oy1 = oy0 + (by1 - by0)
+
+    base_crop = base_rgba.crop((bx0, by0, bx1, by1))
+    over_crop = over_rgba.crop((ox0, oy0, ox1, oy1))
+    composited = Image.alpha_composite(base_crop, over_crop)
+    base_rgba.paste(composited, (bx0, by0))
+
+
+def _save_image_with_options(img: Image.Image, out_path: str, options: RenderOptions) -> None:
+    """Save image with format-specific options based on file extension."""
     ext = os.path.splitext(out_path)[1].lower()
 
     if ext in (".jpg", ".jpeg"):
         q = int(getattr(options, "jpg_quality", 95))
         q = max(1, min(95, q))
-        img_rgb.save(out_path, format="JPEG", quality=q, optimize=True, subsampling=0)
+        # JPEG has no alpha; flatten transparent pixels over white.
+        if img.mode != "RGB":
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "RGBA":
+                bg.paste(img, mask=img.split()[-1])
+            else:
+                bg.paste(img.convert("RGB"))
+            img_jpg = bg
+        else:
+            img_jpg = img
+        img_jpg.save(out_path, format="JPEG", quality=q, optimize=True, subsampling=0)
         return
 
     if ext == ".png":
         cl = int(getattr(options, "png_compress_level", 6))
         cl = max(0, min(9, cl))
-        img_rgb.save(out_path, format="PNG", compress_level=cl)
+        img.save(out_path, format="PNG", compress_level=cl)
         return
 
     # Fallback: rely on Pillow defaults (e.g., tif/tiff)
-    img_rgb.save(out_path)
+    img.save(out_path)
 
 
 def _ensure_output_dimension_limit(out_path: str, canvas_w: int, canvas_h: int) -> None:
@@ -1205,8 +1324,8 @@ def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
     canvas_h = int(math.ceil((max_y - min_y) / mpp))
     _ensure_output_dimension_limit(out_path, canvas_w, canvas_h)
 
-    # Keep base as RGB to reduce memory usage (white background)
-    base = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+    # Keep base as RGBA with transparent background (no-source regions remain transparent)
+    base = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
 
     # Paint higher-altitude first, then lower-altitude last (sharper over)
     metas_sorted = sorted(metas, key=lambda m: _effective_alt_m(m, options), reverse=True)
@@ -1231,7 +1350,7 @@ def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
             canvas_h=canvas_h,
             options=options,
         )
-        _alpha_blend_rgba_over_rgb_inplace(base, warped, offset)
+        _alpha_blend_rgba_over_rgba_inplace(base, warped, offset)
         # Help GC for huge datasets
         del warped
 
@@ -1246,7 +1365,7 @@ def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
     # Finish progress line
     sys.stderr.write("\n")
 
-    # Save as RGB
+    # Save image (PNG keeps alpha; JPEG is flattened to white)
     out_dir = os.path.dirname(os.path.abspath(out_path))
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
@@ -1310,12 +1429,14 @@ def _warp_photo_to_canvas(
     y0 = (meta.lat_deg - origin_lat) * m_per_deg_lat
 
     # Tilt center shift (same as _project_corners)
-    alt_eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
-    tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
-    forward = alt_eff * math.tan(math.radians(tilt_deg))
-    top_world = _yaw_to_top_world(meta.yaw_deg, options)
-    x0 += float(top_world[0]) * forward
-    y0 += float(top_world[1]) * forward
+    # Apply this shift only when use_pitch is set
+    if bool(getattr(options, "use_pitch", False)):
+        alt_eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
+        tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
+        forward = alt_eff * math.tan(math.radians(tilt_deg))
+        top_world = _yaw_to_top_world(meta.yaw_deg, options)
+        x0 += float(top_world[0]) * forward
+        y0 += float(top_world[1]) * forward
 
     mpp_in = _compute_mpp(meta, options)
     right_world, down_world = _yaw_to_image_axes(meta.yaw_deg, options)
@@ -1526,6 +1647,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=2048,
         help="GUI preview max width/height in pixels (default: 2048)",
     )
+    ap.add_argument(
+        "--use-pitch",
+        action="store_true",
+        help="use pitch_deg in geometry (enable tilt-based shift / cos correction)",
+    )
     return ap.parse_args(argv)
 
 
@@ -1552,12 +1678,15 @@ def _warp_photo_to_canvas_from_rgba(
     x0 = (meta.lon_deg - origin_lon) * m_per_deg_lon
     y0 = (meta.lat_deg - origin_lat) * m_per_deg_lat
 
-    alt_eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
-    tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
-    forward = alt_eff * math.tan(math.radians(tilt_deg))
-    top_world = _yaw_to_top_world(meta.yaw_deg, options)
-    x0 += float(top_world[0]) * forward
-    y0 += float(top_world[1]) * forward
+    # Tilt center shift
+    # Apply this shift only when use_pitch is set
+    if bool(getattr(options, "use_pitch", False)):
+        alt_eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
+        tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
+        forward = alt_eff * math.tan(math.radians(tilt_deg))
+        top_world = _yaw_to_top_world(meta.yaw_deg, options)
+        x0 += float(top_world[0]) * forward
+        y0 += float(top_world[1]) * forward
 
     mpp_in = _compute_mpp(meta, options)
     right_world, down_world = _yaw_to_image_axes(meta.yaw_deg, options)
@@ -1858,6 +1987,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             jpg_quality=self.options.jpg_quality,
             png_compress_level=self.options.png_compress_level,
             preview_max_dim=int(getattr(self.options, "preview_max_dim", 2048)),
+            use_pitch=bool(getattr(self.options, "use_pitch", False)),
         )
     
     def _generate_preview(self, max_dim: int = 2048) -> Image.Image:
@@ -2156,6 +2286,14 @@ class MosaicGUI(QtWidgets.QMainWindow):
                 return "N/A"
             return f"avg={float(np.mean(nums)):.2f}, min={float(np.min(nums)):.2f}, max={float(np.max(nums)):.2f}"
 
+        def _first_text(values: List[Optional[str]]) -> str:
+            for v in values:
+                if v is not None:
+                    s = str(v).strip()
+                    if s:
+                        return s
+            return "N/A"
+
         fov_vals = [float(m.hfov_deg) for m in self.metas]
         fov_avg = float(np.mean(fov_vals))
         fov_min = float(np.min(fov_vals))
@@ -2168,9 +2306,14 @@ class MosaicGUI(QtWidgets.QMainWindow):
         fp_line = "Flight Pitch [deg]: " + _stats([getattr(m, "flight_pitch_deg", None) for m in self.metas])
         gp_line = "Gimbal Pitch [deg]: " + _stats([getattr(m, "gimbal_pitch_deg", None) for m in self.metas])
         gr_line = "Gimbal Roll [deg]: " + _stats([getattr(m, "gimbal_roll_deg", None) for m in self.metas])
+        fr_line = "Flight Roll [deg]: " + _stats([getattr(m, "flight_roll_deg", None) for m in self.metas])
         fy_line = "Flight Yaw [deg]: " + _stats([getattr(m, "flight_yaw_deg", None) for m in self.metas])
         gy_line = "Gimbal Yaw [deg]: " + _stats([getattr(m, "gimbal_yaw_deg", None) for m in self.metas])
-        self.exif_stats_label.setText("\n".join([fov_line, fp_line, gp_line, gr_line, fy_line, gy_line]))
+        product_line = "Product Name: " + _first_text([getattr(m, "product_name", None) for m in self.metas])
+        model_line = "Unique Camera Model: " + _first_text([getattr(m, "unique_camera_model", None) for m in self.metas])
+        self.exif_stats_label.setText(
+            "\n".join([product_line, model_line, fov_line, fp_line, gp_line, gr_line, fr_line, fy_line, gy_line])
+        )
 
     def _refresh_metas_for_current_yaw(self) -> None:
         """Reload PhotoMeta list with current yaw rules.
@@ -2310,7 +2453,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             self.canvas_h = int(math.ceil((self.max_y - self.min_y) / self.mpp))
             _ensure_output_dimension_limit(self.out_path, self.canvas_w, self.canvas_h)
 
-            base = Image.new("RGB", (self.canvas_w, self.canvas_h), (255, 255, 255))
+            base = Image.new("RGBA", (self.canvas_w, self.canvas_h), (0, 0, 0, 0))
             metas_sorted = sorted(self.metas, key=lambda m: _effective_alt_m(m, save_opts), reverse=True)
 
             for i, meta in enumerate(metas_sorted):
@@ -2333,7 +2476,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
                     canvas_h=self.canvas_h,
                     options=save_opts,
                 )
-                _alpha_blend_rgba_over_rgb_inplace(base, warped, offset)
+                _alpha_blend_rgba_over_rgba_inplace(base, warped, offset)
                 del warped
 
             progress.setValue(len(metas_sorted))
@@ -2459,6 +2602,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             jpg_quality=self.options.jpg_quality,
             png_compress_level=self.options.png_compress_level,
             preview_max_dim=int(getattr(self.options, "preview_max_dim", 2048)),
+            use_pitch=bool(getattr(self.options, "use_pitch", False)),
         )
         if hasattr(self, "opacity_label"):
             self.opacity_label.setText(f"{int(value)}%")
@@ -2504,6 +2648,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 jpg_quality=int(getattr(args, "jpg_quality", 95)),
                 png_compress_level=int(getattr(args, "png_compress_level", 6)),
                 preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
+                use_pitch=bool(getattr(args, "use_pitch", False)),
             ))
             return
         opts = RenderOptions(
@@ -2521,6 +2666,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             jpg_quality=int(getattr(args, "jpg_quality", 95)),
             png_compress_level=int(getattr(args, "png_compress_level", 6)),
             preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
+            use_pitch=bool(getattr(args, "use_pitch", False)),
         )
         mosaic(args.in_dir, args.out, opts)
     finally:
