@@ -122,6 +122,7 @@ class RenderOptions:
     png_compress_level: int = 6  # PNG compress_level (0-9)
     preview_max_dim: int = 2048  # GUI preview max width/height in pixels
     use_pitch: bool = False  # if True, use pitch_deg in geometry (tilt shift / cos correction)
+    crop_optimize: bool = False  # if True, choose front image per-pixel by nearest image-center distance (save only)
 
 
 def _effective_alt_m(meta: PhotoMeta, options: RenderOptions) -> float:
@@ -1226,6 +1227,93 @@ def _alpha_blend_rgba_over_rgba_inplace(base_rgba: Image.Image, over_rgba: Image
     base_rgba.paste(composited, (bx0, by0))
 
 
+def _photo_center_canvas_xy(
+    meta: PhotoMeta,
+    origin_lat: float,
+    origin_lon: float,
+    min_x: float,
+    max_y: float,
+    mpp_out: float,
+    options: RenderOptions,
+) -> Tuple[float, float]:
+    """Project photo center to canvas coordinates."""
+    m_per_deg_lat, m_per_deg_lon = _meters_per_deg(origin_lat)
+    x0 = (meta.lon_deg - origin_lon) * m_per_deg_lon
+    y0 = (meta.lat_deg - origin_lat) * m_per_deg_lat
+
+    if bool(getattr(options, "use_pitch", False)):
+        alt_eff = float(meta.alt_m) + float(getattr(options, "alt_correction_m", 0.0))
+        tilt_deg = _tilt_from_nadir_deg(getattr(meta, "pitch_deg", -90.0))
+        forward = alt_eff * math.tan(math.radians(tilt_deg))
+        top_world = _yaw_to_top_world(meta.yaw_deg, options)
+        x0 += float(top_world[0]) * forward
+        y0 += float(top_world[1]) * forward
+
+    u, v = _world_to_canvas(
+        np.array([x0], dtype=np.float64),
+        np.array([y0], dtype=np.float64),
+        min_x=min_x,
+        max_y=max_y,
+        mpp=mpp_out,
+    )
+    return float(u[0]), float(v[0])
+
+
+def _composite_nearest_center_rgba_inplace(
+    base_rgba: Image.Image,
+    best_dist2: np.ndarray,
+    over_rgba: Image.Image,
+    dest: Tuple[int, int],
+    center_u: float,
+    center_v: float,
+) -> None:
+    """Per-pixel winner-takes-front by nearest image center distance."""
+    if base_rgba.mode != "RGBA":
+        raise ValueError("base_rgba must be RGBA")
+    if over_rgba.mode != "RGBA":
+        over_rgba = over_rgba.convert("RGBA")
+
+    x, y = int(dest[0]), int(dest[1])
+    if over_rgba.width <= 0 or over_rgba.height <= 0:
+        return
+
+    bx0 = max(0, x)
+    by0 = max(0, y)
+    bx1 = min(base_rgba.width, x + over_rgba.width)
+    by1 = min(base_rgba.height, y + over_rgba.height)
+    if bx1 <= bx0 or by1 <= by0:
+        return
+
+    ox0 = bx0 - x
+    oy0 = by0 - y
+    ox1 = ox0 + (bx1 - bx0)
+    oy1 = oy0 + (by1 - by0)
+
+    over_crop = np.asarray(over_rgba.crop((ox0, oy0, ox1, oy1)), dtype=np.uint8)
+    alpha_mask = over_crop[..., 3] > 0
+    if not np.any(alpha_mask):
+        return
+
+    h = by1 - by0
+    w = bx1 - bx0
+    xs = np.arange(w, dtype=np.float32) + np.float32(bx0)
+    ys = np.arange(h, dtype=np.float32) + np.float32(by0)
+    dx2 = (xs - np.float32(center_u)) ** 2
+    dy2 = (ys - np.float32(center_v)) ** 2
+    d2 = dy2[:, None] + dx2[None, :]
+
+    dist_crop = best_dist2[by0:by1, bx0:bx1]
+    update_mask = alpha_mask & (d2 < dist_crop)
+    if not np.any(update_mask):
+        return
+
+    # np.asarray(PIL.Image) can be read-only; use np.array(copy=True) for writable buffer.
+    base_crop = np.array(base_rgba.crop((bx0, by0, bx1, by1)), dtype=np.uint8, copy=True)
+    base_crop[update_mask] = over_crop[update_mask]
+    dist_crop[update_mask] = d2[update_mask]
+    base_rgba.paste(Image.fromarray(base_crop, mode="RGBA"), (bx0, by0))
+
+
 def _save_image_with_options(img: Image.Image, out_path: str, options: RenderOptions) -> None:
     """Save image with format-specific options based on file extension."""
     ext = os.path.splitext(out_path)[1].lower()
@@ -1329,6 +1417,10 @@ def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
 
     # Paint higher-altitude first, then lower-altitude last (sharper over)
     metas_sorted = sorted(metas, key=lambda m: _effective_alt_m(m, options), reverse=True)
+    use_crop_opt = bool(getattr(options, "crop_optimize", False))
+    best_dist2: Optional[np.ndarray] = None
+    if use_crop_opt:
+        best_dist2 = np.full((canvas_h, canvas_w), np.inf, dtype=np.float32)
 
     total = len(metas_sorted)
     bar_len = 40
@@ -1350,7 +1442,19 @@ def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
             canvas_h=canvas_h,
             options=options,
         )
-        _alpha_blend_rgba_over_rgba_inplace(base, warped, offset)
+        if use_crop_opt and best_dist2 is not None:
+            cu, cv = _photo_center_canvas_xy(
+                meta,
+                origin_lat=origin_lat,
+                origin_lon=origin_lon,
+                min_x=min_x,
+                max_y=max_y,
+                mpp_out=mpp,
+                options=options,
+            )
+            _composite_nearest_center_rgba_inplace(base, best_dist2, warped, offset, cu, cv)
+        else:
+            _alpha_blend_rgba_over_rgba_inplace(base, warped, offset)
         # Help GC for huge datasets
         del warped
 
@@ -1651,6 +1755,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--use-pitch",
         action="store_true",
         help="use pitch_deg in geometry (enable tilt-based shift / cos correction)",
+    )
+    ap.add_argument(
+        "--crop-optimize",
+        action="store_true",
+        help="save-only: in overlap, choose front pixel from image whose center is nearest",
     )
     return ap.parse_args(argv)
 
@@ -1988,6 +2097,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             png_compress_level=self.options.png_compress_level,
             preview_max_dim=int(getattr(self.options, "preview_max_dim", 2048)),
             use_pitch=bool(getattr(self.options, "use_pitch", False)),
+            crop_optimize=bool(getattr(self.options, "crop_optimize", False)),
         )
     
     def _generate_preview(self, max_dim: int = 2048) -> Image.Image:
@@ -2455,6 +2565,10 @@ class MosaicGUI(QtWidgets.QMainWindow):
 
             base = Image.new("RGBA", (self.canvas_w, self.canvas_h), (0, 0, 0, 0))
             metas_sorted = sorted(self.metas, key=lambda m: _effective_alt_m(m, save_opts), reverse=True)
+            use_crop_opt = bool(getattr(save_opts, "crop_optimize", False))
+            best_dist2: Optional[np.ndarray] = None
+            if use_crop_opt:
+                best_dist2 = np.full((self.canvas_h, self.canvas_w), np.inf, dtype=np.float32)
 
             for i, meta in enumerate(metas_sorted):
                 if progress.wasCanceled():
@@ -2476,7 +2590,19 @@ class MosaicGUI(QtWidgets.QMainWindow):
                     canvas_h=self.canvas_h,
                     options=save_opts,
                 )
-                _alpha_blend_rgba_over_rgba_inplace(base, warped, offset)
+                if use_crop_opt and best_dist2 is not None:
+                    cu, cv = _photo_center_canvas_xy(
+                        meta,
+                        origin_lat=self.origin_lat,
+                        origin_lon=self.origin_lon,
+                        min_x=self.min_x,
+                        max_y=self.max_y,
+                        mpp_out=self.mpp,
+                        options=save_opts,
+                    )
+                    _composite_nearest_center_rgba_inplace(base, best_dist2, warped, offset, cu, cv)
+                else:
+                    _alpha_blend_rgba_over_rgba_inplace(base, warped, offset)
                 del warped
 
             progress.setValue(len(metas_sorted))
@@ -2603,6 +2729,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             png_compress_level=self.options.png_compress_level,
             preview_max_dim=int(getattr(self.options, "preview_max_dim", 2048)),
             use_pitch=bool(getattr(self.options, "use_pitch", False)),
+            crop_optimize=bool(getattr(self.options, "crop_optimize", False)),
         )
         if hasattr(self, "opacity_label"):
             self.opacity_label.setText(f"{int(value)}%")
@@ -2649,6 +2776,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 png_compress_level=int(getattr(args, "png_compress_level", 6)),
                 preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
                 use_pitch=bool(getattr(args, "use_pitch", False)),
+                crop_optimize=bool(getattr(args, "crop_optimize", False)),
             ))
             return
         opts = RenderOptions(
@@ -2667,6 +2795,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             png_compress_level=int(getattr(args, "png_compress_level", 6)),
             preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
             use_pitch=bool(getattr(args, "use_pitch", False)),
+            crop_optimize=bool(getattr(args, "crop_optimize", False)),
         )
         mosaic(args.in_dir, args.out, opts)
     finally:
