@@ -3,17 +3,17 @@
 
 <br><br>
 
-# モデル改善サイクル
+# 学習モデル改善サイクル
 機械学習モデルの改善には、次のサイクルを継続的に回す必要があります。それぞれのツールは、以下に記したステップで使用します。
 
 ```mermaid
 flowchart TD
     A["1. 学習用画像の用意<br/>Bird View Pixel Processor"] --> B["2. 正解をラベリング<br/>labelImg"]
-    B --> C["3. 機械学習させる"]
+    B --> C["3. 機械学習させる<br/>YOLO"]
     C --> D["4. 学習モデルを適用して検出<br/>Sliced Yolo Detection"]
     D --> E["5. 検出結果を評価"]
     E --> F["6. 追加の学習データを用意<br/>YOLO Label Reassembler"]
-    F --> C
+    F --> B
 ```
 
 <br><br>
