@@ -3,21 +3,6 @@
 
 <br><br>
 
-# 学習モデル改善サイクル
-機械学習モデルの改善には、次のサイクルを継続的に回す必要があります。それぞれのツールは、以下に記したステップで使用します。
-
-```mermaid
-flowchart TD
-    A["1. 学習用画像の用意<br/>Bird View Pixel Processor"] --> B["2. 正解をラベリング<br/>labelImg"]
-    B --> C["3. 機械学習させる<br/>YOLO"]
-    C --> D["4. 学習モデルを適用して検出<br/>Sliced Yolo Detection"]
-    D --> E["5. 検出結果を評価"]
-    E --> F["6. 追加の学習データを用意<br/>YOLO Label Reassembler"]
-    F --> B
-```
-
-<br><br>
-
 # インストール方法
 本プログラムをお使いの環境にCloneする。または個別の`*.py`ファイルを自分の環境にコピーするだけでも良いです。
 ```
@@ -46,6 +31,20 @@ pip install pillow numpy exifread PyQt6 ultralytics sahi PySide6 pyvips
 
     Sliced Yolo Detectで検出を行った画像とデータから、YOLOモデルの再学習に使うデータを取り出すためのプログラムです。単に巨大な画像を見るためのツールとしても使えます。
 
+<br><br>
+
+# 各ツールの使い所
+機械学習モデルの改善には、次のサイクルを継続的に回す必要があります。それぞれのツールは、以下に記したステップで使用します。
+
+```mermaid
+flowchart TD
+    A["1. 学習用画像の用意<br/>Bird View Pixel Processor"] --> B["2. 正解をラベリング<br/>labelImg"]
+    B --> C["3. 機械学習させる<br/>YOLO"]
+    C --> D["4. 学習モデルを適用して検出<br/>Sliced Yolo Detection"]
+    D --> E["5. 検出結果を評価"]
+    E --> F["6. 追加の学習データを用意<br/>YOLO Label Reassembler"]
+    F --> B
+```
 <br><br>
 
 # 謝辞
