@@ -79,7 +79,7 @@
 
     <img src="attr_panel.png">
 
-    上記の例だと`python bvpp.py .... --alt-correciton -5.7 --yaw-offset -10 --yaw-gimbal-only --yaw-invert`となります。Camera-Water Distance枠に書かれている"Relative Altitude (Exif) stats"というのは、全ての画像のRelative Altitude値の平均・最小・最大値 [m]で、ドローンが認識している飛翔開始地点からの高度です。
+    上記の例だと`python bvpp.py .... --alt-correction -5.7 --yaw-offset -10 --yaw-gimbal-only --yaw-invert`となります。Camera-Water Distance枠に書かれている"Relative Altitude (Exif) stats"というのは、全ての画像のRelative Altitude値の平均・最小・最大値 [m]で、ドローンが認識している飛翔開始地点からの高度です。
 
 7. 画像周辺部の解像力低下の軽減
 レンズの収差などの影響で、画像の周辺部へ行くほど解像力が低下します。`--crop-optimize`オプションを指定すると、複数枚の画像が重なっている領域では、できるだけ各写真の中心寄りの画像を使うように調整します。この手法により解像力低下の影響を軽減できます。このオプションを使用するとプログラムの実行時間が10%ほど長くなり、メモリー消費量は二倍程度増えます。このオプションはディスクに保存されるファイルにだけ反映されます。ウィンドウ内に表示するプレビュー画像には反映されません。

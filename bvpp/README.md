@@ -25,7 +25,7 @@ bvppという名称は、天体写真のモザイク合成に使われるAstro P
 
 ## モザイク合成に使用する元画像への必要要件
 * DJIドローンで撮影されたものであること(Exifの内容に対する要件)
-* 撮影時にカメラが真下を向いていること(Gimbal Pitch Degreeが-90度前後でFlight Pitch Degreeが0度前後であること) --inspect-onlyオプションで入力画像を検査できます。
+* 撮影時にカメラが真下を向いていること(Gimbal Pitch Degreeが-90度であること)
 * 撮影時にカメラがRoll（水平でなくなる）していないこと(Gimbal Roll Degreeが0かnullであること) --inspect-onlyオプションで入力画像を検査できます。
 * 撮影対象の地面あるいは水面が平らであること。
 
@@ -92,7 +92,7 @@ RAMが16GB程度のWSL2/Ubuntu環境の場合は、次の状況でした。仮�
     * --inspect-only : 入力ファイルが意図したExifデータを含んでいるか、Roll/Pitchが想定範囲内か精査して、合成せずに終了
 
 ## 出力ファイルに関して
-    * --out ファイル名 : 保存したい画像のファイル名を指定。拡張子はpng推奨。JPEGは解像度の上限が厳しいので。
+    * --out ファイル名 : 保存したい画像のファイル名を指定。拡張子はpng推奨。JPEG/TIFFは片辺64Kピクセルを超えると保存できない場合があるため。
     * --jpg-quality 95 : 保存するJPEGファイルの品質指定 1-95
     * --png-compress-level 6 : 保存するPNGファイルの品質指定 0-9
 
@@ -102,8 +102,8 @@ RAMが16GB程度のWSL2/Ubuntu環境の場合は、次の状況でした。仮�
     この値とExifのRelative Altitude（ドローンの出発点からの飛翔高度）を足して、カメラから対象までの距離とみなす。マイナス値も可。Relative Altitudeの値は正確ではない場合がありますし、出発地点の高度と湖面の高さが一致していない場合もあるので、このオプションで微調整する。QGIS Vertical Photo Placerを使えば推定できるが、分からない場合は0とし、GUIから調整すべし。
 
 ## ドローンとカメラの水平方向の向きの解釈方法
-    * オプションをつけない場合はExifのFlight Yaw Degree（ドローン機体の水平方向の向きの値）とGimbal Yaw Degree（カメラの水平方向の向きの値）を足した角度だけ画像を回転させる
-    * --yaw-flight-only : Flight Yaw Degreeだけ画像を回転させる。デフォルト値。最初はこれで試してください。
+    * オプションをつけない場合はExifのFlight Yaw Degree（ドローン機体の水平方向の向きの値）だけで画像を回転させる（デフォルト）
+    * --yaw-flight-only : Flight Yaw Degreeだけ画像を回転させる。デフォルト値と同じです。
     * --yaw-gimbal-only : Gimbal Yaw Degreeだけ画像を回転させる
     * --yaw-both : Flight Yaw + Gimbal Yaw Degreeだけ画像を回転させる。
     * --yaw-invert : Yaw Degreeは北方向から時計回りに数えるが、このオプションが指定されると反時計回りと見なす
