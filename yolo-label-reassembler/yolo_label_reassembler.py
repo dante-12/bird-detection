@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from PySide6.QtCore import QObject, QPointF, QRectF, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPen, QPixmap, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsItem,
@@ -492,6 +492,7 @@ class ImageCanvas(QGraphicsView):
     detail_loading_changed = Signal(bool)
     detail_progress_changed = Signal(int, int, str)
     view_metrics_changed = Signal(str)
+    draft_rect_changed = Signal()
 
     def __init__(self, pixmap: QPixmap, in_yolo_path: str, orig_size: Tuple[int, int], parent=None):
         super().__init__(parent)
@@ -642,6 +643,7 @@ class ImageCanvas(QGraphicsView):
         if self._draft_h_text is not None:
             self.scene_obj.removeItem(self._draft_h_text)
             self._draft_h_text = None
+        self.draft_rect_changed.emit()
 
     def _emit_view_metrics(self) -> None:
         # 100% means 1 screen pixel == 1 pixel in the original image.
@@ -707,10 +709,21 @@ class ImageCanvas(QGraphicsView):
         hy = r.top() + (r.height() - h_scene_h) * 0.5
         self._draft_w_text.setPos(wx, wy)
         self._draft_h_text.setPos(hx, hy)
+        self.draft_rect_changed.emit()
 
     def _schedule_detail_update(self) -> None:
         # Wait until user stops wheel/pan; avoid flooding decode requests.
         self._detail_timer.start(140 if self._fast_detail_backend else 320)
+
+    def _invalidate_detail_overlay(self) -> None:
+        # Drop stale detail layer immediately during viewport size changes.
+        self.detail_item.setVisible(False)
+        self._last_detail_key = None
+        self._active_scene_rect = QRectF()
+        self._inflight_key = None
+        # Ignore any detail result produced for the previous geometry.
+        self._latest_request_id += 1
+        self.detail_loading_changed.emit(False)
 
     def _cache_get(self, key: Tuple[int, int, int, int, int, int, int]) -> Optional[QPixmap]:
         pm = self._cache.get(key)
@@ -737,7 +750,9 @@ class ImageCanvas(QGraphicsView):
     def _show_detail(self, scene_rect: QRectF, pixmap: QPixmap) -> None:
         self.detail_item.setPixmap(pixmap)
         self.detail_item.setPos(scene_rect.left(), scene_rect.top())
-        self.detail_item.setScale(scene_rect.width() / max(1.0, float(pixmap.width())))
+        sx = scene_rect.width() / max(1.0, float(pixmap.width()))
+        sy = scene_rect.height() / max(1.0, float(pixmap.height()))
+        self.detail_item.setTransform(QTransform.fromScale(sx, sy))
         self.detail_item.setVisible(True)
 
     def _sync_item_view_scale(self) -> None:
@@ -813,8 +828,11 @@ class ImageCanvas(QGraphicsView):
             max_out = 1400 if self._fast_detail_backend else 900
         else:
             max_out = 3072 if self._fast_detail_backend else 1400
-        out_w = min(raw_out_w, max_out)
-        out_h = min(raw_out_h, max_out)
+        # Keep output aspect ratio. Independent clamping can distort and cause
+        # visible layer misalignment against the base preview when zoomed.
+        shrink = min(1.0, max_out / max(1, raw_out_w), max_out / max(1, raw_out_h))
+        out_w = max(1, int(round(raw_out_w * shrink)))
+        out_h = max(1, int(round(raw_out_h * shrink)))
         lod = _pick_lod(ow, oh, out_w, out_h)
 
         key = (ox1, oy1, ow, oh, out_w, out_h, lod)
@@ -825,7 +843,7 @@ class ImageCanvas(QGraphicsView):
 
         cached = self._cache_get(key)
         if cached is not None:
-            self._show_detail(scene_rect, cached)
+            self._show_detail(self._active_scene_rect, cached)
             self.detail_loading_changed.emit(False)
             return
 
@@ -931,6 +949,7 @@ class ImageCanvas(QGraphicsView):
             if self.draft_rect and (self.draft_rect.rect().width() < 1 or self.draft_rect.rect().height() < 1):
                 self.scene_obj.removeItem(self.draft_rect)
                 self.draft_rect = None
+                self.draft_rect_changed.emit()
             self._schedule_detail_update()
             return
 
@@ -953,6 +972,7 @@ class ImageCanvas(QGraphicsView):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._invalidate_detail_overlay()
         self._sync_item_view_scale()
         self._update_draft_metrics_overlay()
         self._emit_view_metrics()
@@ -969,6 +989,7 @@ class ImageCanvas(QGraphicsView):
         ):
             self.scene_obj.removeItem(self.draft_rect)
             self.draft_rect = None
+            self.draft_rect_changed.emit()
             return
         super().keyPressEvent(event)
 
@@ -1085,6 +1106,30 @@ def write_yolo_labels(
         raise ValueError("Invalid crop size.")
 
     lines: List[str] = []
+    for class_id, lx1, lx2, ly1, ly2 in iter_crop_records_for_export(records, crop_rect):
+        bw = lx2 - lx1
+        bh = ly2 - ly1
+
+        cx = lx1 + bw / 2.0
+        cy = ly1 + bh / 2.0
+        cx_n = min(max(cx / cw, 0.0), 1.0)
+        cy_n = min(max(cy / ch, 0.0), 1.0)
+        bw_n = min(max(bw / cw, 0.0), 1.0)
+        bh_n = min(max(bh / ch, 0.0), 1.0)
+        lines.append(f"{class_id} {cx_n:.6f} {cy_n:.6f} {bw_n:.6f} {bh_n:.6f}")
+
+    with open(out_txt, "w", encoding="utf-8") as f:
+        if lines:
+            f.write("\n".join(lines))
+            f.write("\n")
+    return len(lines)
+
+
+def iter_crop_records_for_export(
+    records: List[DetectionRecord],
+    crop_rect: Tuple[int, int, int, int],
+):
+    rx1, ry1, rx2, ry2 = crop_rect
     for rec in records:
         if not (rec.x1 >= rx1 and rec.x2 <= rx2 and rec.y1 >= ry1 and rec.y2 <= ry2):
             continue
@@ -1102,20 +1147,11 @@ def write_yolo_labels(
         bh = ly2 - ly1
         if bw <= 0 or bh <= 0:
             continue
+        yield class_id, lx1, lx2, ly1, ly2
 
-        cx = lx1 + bw / 2.0
-        cy = ly1 + bh / 2.0
-        cx_n = min(max(cx / cw, 0.0), 1.0)
-        cy_n = min(max(cy / ch, 0.0), 1.0)
-        bw_n = min(max(bw / cw, 0.0), 1.0)
-        bh_n = min(max(bh / ch, 0.0), 1.0)
-        lines.append(f"{class_id} {cx_n:.6f} {cy_n:.6f} {bw_n:.6f} {bh_n:.6f}")
 
-    with open(out_txt, "w", encoding="utf-8") as f:
-        if lines:
-            f.write("\n".join(lines))
-            f.write("\n")
-    return len(lines)
+def count_objects_in_crop(records: List[DetectionRecord], crop_rect: Tuple[int, int, int, int]) -> int:
+    return sum(1 for _ in iter_crop_records_for_export(records, crop_rect))
 
 
 class MainWindow(QMainWindow):
@@ -1216,14 +1252,20 @@ class MainWindow(QMainWindow):
         self.canvas.view_metrics_changed.connect(self._on_view_metrics_changed)
         self.canvas.detail_loading_changed.connect(self._on_detail_loading_changed)
         self.canvas.detail_progress_changed.connect(self._on_detail_progress_changed)
+        self.canvas.draft_rect_changed.connect(self._on_draft_rect_changed)
+        self._selection_count_timer = QTimer(self)
+        self._selection_count_timer.setSingleShot(True)
+        self._selection_count_timer.setInterval(80)
+        self._selection_count_timer.timeout.connect(self._update_edit_mode_message)
 
     def set_edit_mode(self, enabled: bool) -> None:
         self.is_edit_mode = enabled
         self.canvas.set_edit_mode(enabled)
         if enabled:
             self.btn_edit.setText("Exit Edit")
-            self.msg_label.setText("Edit mode: draw one red rectangle on the image.")
+            self._update_edit_mode_message()
         else:
+            self._selection_count_timer.stop()
             self.btn_edit.setText("Edit")
             self.msg_label.setText("Edit mode disabled.")
 
@@ -1283,6 +1325,25 @@ class MainWindow(QMainWindow):
         self._save_in_progress = False
         self.canvas.set_edit_interaction_locked(False)
         self.save_progress.setVisible(False)
+
+    @Slot()
+    def _on_draft_rect_changed(self) -> None:
+        if not self.is_edit_mode or self._save_in_progress:
+            return
+        self._selection_count_timer.start()
+
+    def _update_edit_mode_message(self) -> None:
+        if not self.is_edit_mode:
+            return
+        rect = self.canvas.get_draft_rect_in_orig()
+        if rect is None:
+            self.msg_label.setText("Edit mode: draw one red rectangle on the image.")
+            return
+        x1, y1, x2, y2 = rect
+        count = count_objects_in_crop(self.records, rect)
+        self.msg_label.setText(
+            f"Edit mode: selected {count} objects in rectangle ({x2 - x1} x {y2 - y1} px)."
+        )
 
     def _on_save_done(self, out_png: str, out_txt: str, n: int) -> None:
         self.canvas.finalize_current_rect()
