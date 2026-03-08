@@ -720,6 +720,7 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
     lat, lon = _extract_lat_lon(tags)
     alt = _extract_alt(tags)
     yaw = _extract_yaw(tags, options)
+    pitch = _extract_pitch(tags)
     flight_yaw = _extract_flight_yaw(tags)
     gimbal_yaw = _extract_gimbal_yaw(tags)
     flight_pitch = _extract_flight_pitch(tags)
@@ -743,11 +744,27 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
         ),
     )
 
-    pitch = _extract_pitch(tags)
-    if pitch is not None:
-        # Expected around -90 deg (nadir)
-        if abs(float(pitch) - (-90.0)) > 10.0:
-            sys.stderr.write(f"WARN: Total of Gimbal Pitch + Flight Pitch degree not near -90 deg: {path} pitch={pitch}\n")
+    if (
+        (flight_pitch is not None and abs(float(flight_pitch)) > 25.0)
+        or (flight_roll is not None and abs(float(flight_roll)) > 25.0)
+    ):
+        sys.stderr.write(
+            "WARN: Flight Pitch Degree or Flight Roll Degree exceeds +/-25 deg; "
+            f"Gimbal may not be level: {path} "
+            f"flight_pitch={flight_pitch} flight_roll={flight_roll}\n"
+        )
+
+    if gimbal_pitch is not None and abs(float(gimbal_pitch) - (-90.0)) > 1e-6:
+        sys.stderr.write(
+            "WARN: Gimbal Pitch Degree is not -90 deg; "
+            f"Gimbal may not be level: {path} gimbal_pitch={gimbal_pitch}\n"
+        )
+
+    if gimbal_roll is not None and abs(float(gimbal_roll)) > 1e-6:
+        sys.stderr.write(
+            "WARN: Gimbal Roll Degree is not 0 deg; "
+            f"Gimbal may not be level: {path} gimbal_roll={gimbal_roll}\n"
+        )
 
     hfov = _extract_fov(tags, w, h)
 
