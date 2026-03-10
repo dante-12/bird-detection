@@ -29,6 +29,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import json
 import math
@@ -48,6 +49,11 @@ try:
 except Exception:  # pragma: no cover
     exifread = None
 
+try:
+    import resource
+except Exception:  # pragma: no cover
+    resource = None
+
 # Optional GUI dependencies (PyQt6)
 try:
     from PyQt6 import QtCore, QtGui, QtWidgets
@@ -59,6 +65,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
 MAX_JPG_TIF_DIM_PX = 64000
+MEMORY_SAFETY_MARGIN_BYTES = 512 * 1024 * 1024
 
 # Metadata keys we expect to use (as seen by exifread)
 INSPECT_KEYS: Dict[str, Tuple[str, ...]] = {
@@ -123,6 +130,155 @@ class RenderOptions:
     preview_max_dim: int = 2048  # GUI preview max width/height in pixels
     use_pitch: bool = False  # if True, use pitch_deg in geometry (tilt shift / cos correction)
     crop_optimize: bool = False  # if True, choose front image per-pixel by nearest image-center distance (save only)
+
+
+class MemoryPressureError(RuntimeError):
+    """Raised when the estimated memory demand is too close to the system limit."""
+
+
+def _format_bytes_hr(num_bytes: float) -> str:
+    n = float(max(num_bytes, 0.0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0:
+            return f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}PB"
+
+
+def _read_first_line(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.readline().strip()
+    except Exception:
+        return None
+
+
+def _cgroup_memory_limit_bytes() -> Optional[int]:
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        raw = _read_first_line(path)
+        if not raw or raw == "max":
+            continue
+        try:
+            val = int(raw)
+        except Exception:
+            continue
+        if val > 0 and val < (1 << 60):
+            return val
+    return None
+
+
+def _cgroup_memory_current_bytes() -> Optional[int]:
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        raw = _read_first_line(path)
+        if not raw:
+            continue
+        try:
+            val = int(raw)
+        except Exception:
+            continue
+        if val >= 0:
+            return val
+    return None
+
+
+def _system_mem_available_bytes() -> Optional[int]:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def _process_rss_bytes() -> Optional[int]:
+    if resource is None:
+        return None
+    try:
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(rss_kb) * 1024
+    except Exception:
+        return None
+
+
+def _memory_headroom_bytes() -> Optional[int]:
+    candidates: List[int] = []
+    system_available = _system_mem_available_bytes()
+    if system_available is not None:
+        candidates.append(system_available)
+
+    cgroup_limit = _cgroup_memory_limit_bytes()
+    cgroup_current = _cgroup_memory_current_bytes()
+    if cgroup_limit is not None and cgroup_current is not None:
+        candidates.append(max(cgroup_limit - cgroup_current, 0))
+
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+def _estimated_canvas_memory_bytes(canvas_w: int, canvas_h: int, out_path: str, use_crop_opt: bool) -> int:
+    pixels = int(canvas_w) * int(canvas_h)
+    total = pixels * 4  # RGBA base canvas
+    if use_crop_opt:
+        total += pixels * 4  # float32 best_dist2
+    ext = os.path.splitext(out_path)[1].lower()
+    if ext in (".jpg", ".jpeg"):
+        total += pixels * 3  # RGB flatten buffer for JPEG save
+    total += pixels // 8  # small Pillow/allocator slack for giant images
+    return total
+
+
+def _estimate_photo_peak_bytes(
+    meta: PhotoMeta,
+    canvas_w: int,
+    canvas_h: int,
+    mpp_out: float,
+    options: RenderOptions,
+) -> int:
+    base = int(meta.w) * int(meta.h) * 4  # decoded RGBA source
+    if not bool(getattr(options, "roi_warp", True)):
+        roi_pixels = int(canvas_w) * int(canvas_h)
+    else:
+        scale = _compute_mpp(meta, options) / max(float(mpp_out), 1e-9)
+        roi_w = min(canvas_w, max(1, int(math.ceil(meta.w * scale)) + 2 * int(getattr(options, "roi_margin_px", 8))))
+        roi_h = min(canvas_h, max(1, int(math.ceil(meta.h * scale)) + 2 * int(getattr(options, "roi_margin_px", 8))))
+        roi_pixels = roi_w * roi_h
+    roi_rgba = roi_pixels * 4
+    composite_tmp = roi_pixels * 8
+    return base + roi_rgba + composite_tmp
+
+
+def _ensure_memory_headroom(required_bytes: int, context: str, margin_bytes: int = MEMORY_SAFETY_MARGIN_BYTES) -> None:
+    headroom = _memory_headroom_bytes()
+    if headroom is None:
+        return
+    if required_bytes + margin_bytes <= headroom:
+        return
+
+    rss = _process_rss_bytes()
+    shortage = required_bytes + margin_bytes - headroom
+    if required_bytes > headroom:
+        msg = (
+            f"Memory check failed before {context}: estimated additional memory "
+            f"{_format_bytes_hr(required_bytes)} exceeds available headroom "
+            f"{_format_bytes_hr(headroom)} by {_format_bytes_hr(shortage)}."
+        )
+    else:
+        msg = (
+            f"Memory check failed before {context}: estimated additional memory "
+            f"{_format_bytes_hr(required_bytes)} leaves less than the required safety margin "
+            f"with available headroom {_format_bytes_hr(headroom)}."
+        )
+    if margin_bytes > 0:
+        msg += f" Safety margin: {_format_bytes_hr(margin_bytes)}."
+    if rss is not None:
+        msg += f" Current process RSS peak: {_format_bytes_hr(rss)}."
+    msg += " Reduce output size, disable crop optimization, or free system memory and try again."
+    raise MemoryPressureError(msg)
 
 
 def _effective_alt_m(meta: PhotoMeta, options: RenderOptions) -> float:
@@ -1376,6 +1532,25 @@ def _ensure_output_dimension_limit(out_path: str, canvas_w: int, canvas_h: int) 
         )
 
 
+def _ensure_save_memory_headroom(
+    canvas_w: int,
+    canvas_h: int,
+    out_path: str,
+    metas: List[PhotoMeta],
+    options: RenderOptions,
+    mpp_out: float,
+) -> None:
+    use_crop_opt = bool(getattr(options, "crop_optimize", False))
+    canvas_bytes = _estimated_canvas_memory_bytes(canvas_w, canvas_h, out_path, use_crop_opt)
+    peak_photo_bytes = 0 if not metas else max(
+        _estimate_photo_peak_bytes(meta, canvas_w, canvas_h, mpp_out, options) for meta in metas
+    )
+    _ensure_memory_headroom(
+        canvas_bytes + peak_photo_bytes,
+        context=f"allocating {canvas_w}x{canvas_h} save buffers",
+    )
+
+
 def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
     # Preflight inspection removed; only --inspect-only in main() will run inspect_directory(in_dir)
     paths = _list_images(in_dir)
@@ -1428,6 +1603,7 @@ def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
     canvas_w = int(math.ceil((max_x - min_x) / mpp))
     canvas_h = int(math.ceil((max_y - min_y) / mpp))
     _ensure_output_dimension_limit(out_path, canvas_w, canvas_h)
+    _ensure_save_memory_headroom(canvas_w, canvas_h, out_path, metas, options, mpp)
 
     # Keep base as RGBA with transparent background (no-source regions remain transparent)
     base = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
@@ -1447,6 +1623,12 @@ def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
         fname = os.path.basename(meta.path)
         sys.stderr.write(f"Processing {idx+1}/{total}: {fname}\n")
         sys.stderr.flush()
+
+        _ensure_memory_headroom(
+            _estimate_photo_peak_bytes(meta, canvas_w, canvas_h, mpp, options),
+            context=f"processing {fname}",
+            margin_bytes=MEMORY_SAFETY_MARGIN_BYTES // 2,
+        )
 
         warped, offset = _warp_photo_to_canvas(
             meta,
@@ -2168,6 +2350,47 @@ class MosaicGUI(QtWidgets.QMainWindow):
 
         return base
 
+    def _release_preview_memory(self) -> None:
+        """Release preview caches and Qt display objects before full-res save."""
+        self.preview_image = None
+        self._preview_layers = []
+        self._preview_layer_metas = []
+        self._preview_src_rgba.clear()
+        if hasattr(self, "scene"):
+            self.scene.clear()
+        if hasattr(self, "view"):
+            self.view._layer_regions = []
+            self.view.viewport().update()
+        gc.collect()
+
+    def _show_preview_placeholder(self, message: str) -> None:
+        """Show a temporary message while preview data is unavailable."""
+        if not hasattr(self, "scene"):
+            return
+        self.scene.clear()
+        text_item = self.scene.addText(message)
+        font = text_item.font()
+        font.setPointSize(16)
+        text_item.setFont(font)
+        text_item.setDefaultTextColor(QtGui.QColor("#555555"))
+        rect = text_item.boundingRect()
+        pad_x = 40.0
+        pad_y = 30.0
+        self.scene.setSceneRect(0, 0, rect.width() + pad_x * 2, rect.height() + pad_y * 2)
+        text_item.setPos(pad_x, pad_y)
+        if hasattr(self, "view"):
+            self.view._layer_regions = []
+            self.view.viewport().update()
+
+    def _restore_preview_after_save(self) -> None:
+        """Rebuild preview caches after a save attempt finishes."""
+        sys.stderr.write("Restoring preview...\n")
+        self._update_preview_geometry_for_current_options()
+        self._build_preview_source_cache()
+        self.preview_image = self._generate_preview()
+        self._update_display()
+        gc.collect()
+
     def _update_display(self):
         """Display current preview_image (already mosaicked) and update hover regions."""
         self.scene.clear()
@@ -2572,6 +2795,13 @@ class MosaicGUI(QtWidgets.QMainWindow):
         progress.setValue(0)
 
         try:
+            progress.setLabelText("Releasing preview memory...")
+            QtWidgets.QApplication.processEvents()
+            self.statusBar().showMessage("Releasing preview memory before save...")
+            self._release_preview_memory()
+            self._show_preview_placeholder("Saving in progress...\nPreview is temporarily unavailable.")
+            QtWidgets.QApplication.processEvents()
+
             save_opts = self._get_current_options()
 
             # Recompute full-res canvas with current options
@@ -2579,6 +2809,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             self.canvas_w = int(math.ceil((self.max_x - self.min_x) / self.mpp))
             self.canvas_h = int(math.ceil((self.max_y - self.min_y) / self.mpp))
             _ensure_output_dimension_limit(self.out_path, self.canvas_w, self.canvas_h)
+            _ensure_save_memory_headroom(self.canvas_w, self.canvas_h, self.out_path, self.metas, save_opts, self.mpp)
 
             base = Image.new("RGBA", (self.canvas_w, self.canvas_h), (0, 0, 0, 0))
             metas_sorted = sorted(self.metas, key=lambda m: _effective_alt_m(m, save_opts), reverse=True)
@@ -2595,6 +2826,12 @@ class MosaicGUI(QtWidgets.QMainWindow):
                 progress.setValue(i)
                 progress.setLabelText(f"Processing {i+1}/{len(metas_sorted)}: {os.path.basename(meta.path)}")
                 QtWidgets.QApplication.processEvents()
+
+                _ensure_memory_headroom(
+                    _estimate_photo_peak_bytes(meta, self.canvas_w, self.canvas_h, self.mpp, save_opts),
+                    context=f"processing {os.path.basename(meta.path)}",
+                    margin_bytes=MEMORY_SAFETY_MARGIN_BYTES // 2,
+                )
 
                 warped, offset = _warp_photo_to_canvas(
                     meta,
@@ -2636,11 +2873,24 @@ class MosaicGUI(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Saved to {saved_path}")
             QtWidgets.QMessageBox.information(self, "Success", f"Saved to: {saved_path}")
 
+        except MemoryPressureError as e:
+            progress.close()
+            self.statusBar().showMessage("Save aborted: insufficient memory")
+            QtWidgets.QMessageBox.warning(self, "Insufficient Memory", str(e))
+            sys.stderr.write(f"Memory check aborted save: {e}\n")
         except Exception as e:
             progress.close()
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save:\n{str(e)}")
             sys.stderr.write(f"Error during save: {e}\n")
         finally:
+            try:
+                progress.setLabelText("Restoring preview...")
+                self.statusBar().showMessage("Restoring preview... Please wait.")
+                self._show_preview_placeholder("Rebuilding preview...\nPlease wait.")
+                QtWidgets.QApplication.processEvents()
+                self._restore_preview_after_save()
+            except Exception as e:
+                sys.stderr.write(f"Warning: failed to restore preview after save: {e}\n")
             progress.close()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent):
@@ -2772,12 +3022,32 @@ def launch_gui(in_dir: str, out_path: str, options: RenderOptions) -> None:
 def main(argv: Optional[List[str]] = None) -> None:
     t0 = time.perf_counter()
     try:
-        args = _parse_args(argv)
-        if getattr(args, "inspect_only", False):
-            inspect_directory(args.in_dir)
-            return
-        if getattr(args, "gui", False):
-            launch_gui(args.in_dir, args.out, RenderOptions(
+        try:
+            args = _parse_args(argv)
+            if getattr(args, "inspect_only", False):
+                inspect_directory(args.in_dir)
+                return
+            if getattr(args, "gui", False):
+                launch_gui(args.in_dir, args.out, RenderOptions(
+                    undistort=bool(getattr(args, "undistort", False)),
+                    k1=float(getattr(args, "k1", 0.0)),
+                    alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
+                    yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
+                    yaw_invert=bool(getattr(args, "yaw_invert", False)),
+                    yaw_both=bool(getattr(args, "yaw_both", False)),
+                    yaw_gimbal_only=bool(getattr(args, "yaw_gimbal_only", False)),
+                    yaw_flight_only=bool(getattr(args, "yaw_flight_only", False)),
+                    opacity_pct=float(getattr(args, "opacity", 100.0)),
+                    roi_warp=not bool(getattr(args, "no_roi_warp", False)),
+                    roi_margin_px=int(getattr(args, "roi_margin", 8)),
+                    jpg_quality=int(getattr(args, "jpg_quality", 95)),
+                    png_compress_level=int(getattr(args, "png_compress_level", 6)),
+                    preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
+                    use_pitch=bool(getattr(args, "use_pitch", False)),
+                    crop_optimize=bool(getattr(args, "crop_optimize", False)),
+                ))
+                return
+            opts = RenderOptions(
                 undistort=bool(getattr(args, "undistort", False)),
                 k1=float(getattr(args, "k1", 0.0)),
                 alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
@@ -2794,27 +3064,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                 preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
                 use_pitch=bool(getattr(args, "use_pitch", False)),
                 crop_optimize=bool(getattr(args, "crop_optimize", False)),
-            ))
-            return
-        opts = RenderOptions(
-            undistort=bool(getattr(args, "undistort", False)),
-            k1=float(getattr(args, "k1", 0.0)),
-            alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
-            yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
-            yaw_invert=bool(getattr(args, "yaw_invert", False)),
-            yaw_both=bool(getattr(args, "yaw_both", False)),
-            yaw_gimbal_only=bool(getattr(args, "yaw_gimbal_only", False)),
-            yaw_flight_only=bool(getattr(args, "yaw_flight_only", False)),
-            opacity_pct=float(getattr(args, "opacity", 100.0)),
-            roi_warp=not bool(getattr(args, "no_roi_warp", False)),
-            roi_margin_px=int(getattr(args, "roi_margin", 8)),
-            jpg_quality=int(getattr(args, "jpg_quality", 95)),
-            png_compress_level=int(getattr(args, "png_compress_level", 6)),
-            preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
-            use_pitch=bool(getattr(args, "use_pitch", False)),
-            crop_optimize=bool(getattr(args, "crop_optimize", False)),
-        )
-        mosaic(args.in_dir, args.out, opts)
+            )
+            mosaic(args.in_dir, args.out, opts)
+        except MemoryPressureError as e:
+            raise SystemExit(str(e))
     finally:
         dt = time.perf_counter() - t0
         sys.stderr.write(f"Elapsed: {dt:.3f} sec\n")
