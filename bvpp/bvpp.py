@@ -31,13 +31,15 @@ from __future__ import annotations
 import argparse
 import gc
 import glob
+import io
 import json
 import math
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+import threading
+from dataclasses import dataclass, field
+from typing import BinaryIO, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image
@@ -143,6 +145,83 @@ def _format_bytes_hr(num_bytes: float) -> str:
             return f"{n:.1f}{unit}"
         n /= 1024.0
     return f"{n:.1f}PB"
+
+
+@dataclass
+class SaveProgressState:
+    start_time: float = field(default_factory=time.perf_counter)
+    bytes_written: int = 0
+    done: bool = False
+    error: Optional[str] = None
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def add_bytes(self, count: int) -> None:
+        with self.lock:
+            self.bytes_written += max(int(count), 0)
+
+    def mark_done(self, error: Optional[BaseException] = None) -> None:
+        with self.lock:
+            self.done = True
+            self.error = None if error is None else str(error)
+
+    def snapshot(self) -> Tuple[float, int, bool, Optional[str]]:
+        with self.lock:
+            return self.start_time, self.bytes_written, self.done, self.error
+
+
+class ProgressFileWrapper:
+    """Proxy file object that tracks bytes written by Pillow."""
+
+    def __init__(self, raw: BinaryIO, state: SaveProgressState):
+        self._raw = raw
+        self._state = state
+
+    def write(self, data) -> int:
+        written = self._raw.write(data)
+        count = len(data) if written is None else int(written)
+        self._state.add_bytes(count)
+        return written
+
+    def writelines(self, lines) -> None:
+        for line in lines:
+            self.write(line)
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation("ProgressFileWrapper does not expose fileno")
+
+    def __getattr__(self, name: str):
+        return getattr(self._raw, name)
+
+
+def _save_progress_metrics(state: SaveProgressState) -> Tuple[float, int, float]:
+    start_time, bytes_written, _, _ = state.snapshot()
+    elapsed = max(time.perf_counter() - start_time, 0.0)
+    speed_mb_s = 0.0 if elapsed <= 1e-6 else (bytes_written / (1024.0 * 1024.0)) / elapsed
+    return elapsed, bytes_written, speed_mb_s
+
+
+def _format_save_progress_text(state: SaveProgressState, prefix: str = "Saving...") -> str:
+    elapsed, bytes_written, speed_mb_s = _save_progress_metrics(state)
+    return (
+        f"{prefix} elapsed {elapsed:.1f}s, "
+        f"size {_format_bytes_hr(bytes_written)}, speed {speed_mb_s:.1f} MB/s"
+    )
+
+
+def _save_image_job(img: Image.Image, out_path: str, options: RenderOptions, state: SaveProgressState) -> None:
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        with open(out_path, "wb") as raw_fp:
+            progress_fp = ProgressFileWrapper(raw_fp, state)
+            _save_image_with_options(img, progress_fp, options, out_path_hint=out_path)
+            progress_fp.flush()
+        state.mark_done()
+    except BaseException as exc:
+        state.mark_done(exc)
+        raise
 
 
 def _read_first_line(path: str) -> Optional[str]:
@@ -1487,9 +1566,15 @@ def _composite_nearest_center_rgba_inplace(
     base_rgba.paste(Image.fromarray(base_crop, mode="RGBA"), (bx0, by0))
 
 
-def _save_image_with_options(img: Image.Image, out_path: str, options: RenderOptions) -> None:
+def _save_image_with_options(
+    img: Image.Image,
+    out_target: Union[str, BinaryIO],
+    options: RenderOptions,
+    out_path_hint: Optional[str] = None,
+) -> None:
     """Save image with format-specific options based on file extension."""
-    ext = os.path.splitext(out_path)[1].lower()
+    resolved_path = out_path_hint if out_path_hint is not None else str(out_target)
+    ext = os.path.splitext(resolved_path)[1].lower()
 
     if ext in (".jpg", ".jpeg"):
         q = int(getattr(options, "jpg_quality", 95))
@@ -1504,17 +1589,30 @@ def _save_image_with_options(img: Image.Image, out_path: str, options: RenderOpt
             img_jpg = bg
         else:
             img_jpg = img
-        img_jpg.save(out_path, format="JPEG", quality=q, optimize=True, subsampling=0)
+        img_jpg.save(out_target, format="JPEG", quality=q, optimize=True, subsampling=0)
         return
 
     if ext == ".png":
         cl = int(getattr(options, "png_compress_level", 6))
         cl = max(0, min(9, cl))
-        img.save(out_path, format="PNG", compress_level=cl)
+        img.save(out_target, format="PNG", compress_level=cl)
         return
 
     # Fallback: rely on Pillow defaults (e.g., tif/tiff)
-    img.save(out_path)
+    img.save(out_target)
+
+
+def _cli_save_progress_printer(
+    state: SaveProgressState,
+    stop_event: threading.Event,
+    widths: List[int],
+    interval_sec: float = 0.5,
+) -> None:
+    while not stop_event.wait(interval_sec):
+        line = _format_save_progress_text(state)
+        widths[0] = max(widths[0], len(line))
+        sys.stderr.write("\r" + line.ljust(widths[0]))
+        sys.stderr.flush()
 
 
 def _ensure_output_dimension_limit(out_path: str, canvas_w: int, canvas_h: int) -> None:
@@ -1677,8 +1775,31 @@ def mosaic(in_dir: str, out_path: str, options: RenderOptions) -> None:
     sys.stderr.write(f"Saving to {out_path} ... this may take a while\n")
     sys.stderr.flush()
     t_save0 = time.perf_counter()
-    _save_image_with_options(base, out_path, options)
+    save_state = SaveProgressState(start_time=t_save0)
+    save_stop = threading.Event()
+    cli_widths = [0]
+    save_monitor = threading.Thread(
+        target=_cli_save_progress_printer,
+        args=(save_state, save_stop, cli_widths, 0.5),
+        daemon=True,
+    )
+    save_monitor.start()
+    try:
+        _save_image_job(base, out_path, options, save_state)
+    except Exception:
+        partial_save_line = _format_save_progress_text(save_state)
+        cli_widths[0] = max(cli_widths[0], len(partial_save_line))
+        sys.stderr.write("\r" + partial_save_line.ljust(cli_widths[0]) + "\n")
+        sys.stderr.flush()
+        raise
+    finally:
+        save_stop.set()
+        save_monitor.join()
     t_save = time.perf_counter() - t_save0
+    final_save_line = _format_save_progress_text(save_state)
+    cli_widths[0] = max(cli_widths[0], len(final_save_line))
+    sys.stderr.write("\r" + final_save_line.ljust(cli_widths[0]) + "\n")
+    sys.stderr.flush()
 
     # After saving (headless), report full path, resolution and file size
     try:
@@ -2860,14 +2981,46 @@ class MosaicGUI(QtWidgets.QMainWindow):
                 del warped
 
             progress.setValue(len(metas_sorted))
-            progress.setLabelText("Saving...")
+            progress.setRange(0, 0)
+            progress.setLabelText("Saving... preparing metrics")
+            progress.setCancelButton(None)
             QtWidgets.QApplication.processEvents()
 
             out_dir = os.path.dirname(os.path.abspath(self.out_path))
             if out_dir and not os.path.isdir(out_dir):
                 os.makedirs(out_dir, exist_ok=True)
 
-            _save_image_with_options(base, self.out_path, save_opts)
+            save_state = SaveProgressState()
+            save_result: Dict[str, Optional[BaseException]] = {"error": None}
+
+            def _save_worker() -> None:
+                try:
+                    _save_image_job(base, self.out_path, save_opts, save_state)
+                except BaseException as exc:
+                    save_result["error"] = exc
+
+            save_thread = threading.Thread(target=_save_worker, daemon=True)
+            save_loop = QtCore.QEventLoop()
+            save_timer = QtCore.QTimer(self)
+            save_timer.setInterval(500)
+
+            def _update_save_ui() -> None:
+                msg = _format_save_progress_text(save_state)
+                progress.setLabelText(msg.replace(", ", " / "))
+                self.statusBar().showMessage(msg)
+                if not save_thread.is_alive():
+                    save_timer.stop()
+                    save_loop.quit()
+
+            save_timer.timeout.connect(_update_save_ui)
+            save_thread.start()
+            _update_save_ui()
+            save_timer.start()
+            save_loop.exec()
+            save_thread.join()
+
+            if save_result["error"] is not None:
+                raise save_result["error"]
 
             saved_path = os.path.abspath(self.out_path)
             self.statusBar().showMessage(f"Saved to {saved_path}")
