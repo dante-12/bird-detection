@@ -9,10 +9,17 @@
 git clone https://github.com/dante-12/bird-detection.git
 ```
 
-次に実行に必要なツールやライブラリをインストールする。Ubuntuの場合は以下の通り。macOSだと一行目は`sudo apt ...`の代わりに`brew install ...`など。
+次に、実行に必要なツールやライブラリをインストールする。
 
+Ubuntuの場合(WSL/Ubuntuの場合も)
 ```
 sudo apt install -y exiftool libxcb-cursor0 libvips
+pip install pillow numpy exifread PyQt6 ultralytics sahi PySide6 pyvips
+```
+
+macOSの場合
+```
+brew install exiftool libvips
 pip install pillow numpy exifread PyQt6 ultralytics sahi PySide6 pyvips
 ```
 
