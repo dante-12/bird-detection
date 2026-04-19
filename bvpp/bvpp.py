@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from typing import BinaryIO, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 import time
 
@@ -117,7 +117,9 @@ class PhotoMeta:
 @dataclass(frozen=True)
 class RenderOptions:
     undistort: bool = False
-    k1: float = 0.0  # positive -> barrel, negative -> pincushion (simple model)
+    k1: float = 0.1400
+    k2: float = -0.3979
+    k3: float = 0.4837
     alt_correction_m: float = 0.0  # effective altitude = Relative Altitude + alt_correction_m
     yaw_offset_deg: float = 0.0  # additional yaw correction (degrees, clockwise from north)
     yaw_invert: bool = False  # if True, use -yaw (legacy behavior)
@@ -193,6 +195,137 @@ class ProgressFileWrapper:
         return getattr(self._raw, name)
 
 
+def _yaw_mode_label(options: RenderOptions) -> str:
+    if bool(getattr(options, "yaw_gimbal_only", False)):
+        return "gimbal_only"
+    if bool(getattr(options, "yaw_both", False)):
+        return "flight+gimbal"
+    return "flight_only"
+
+
+def _build_parameter_overlay_lines(options: RenderOptions, out_path: str) -> List[str]:
+    ext = os.path.splitext(out_path)[1].lower()
+    items: List[Tuple[str, str]] = [
+        ("out_format", ext.lstrip(".") or "auto"),
+        ("alt_correction_m", f"{float(getattr(options, 'alt_correction_m', 0.0)):.2f}"),
+        ("yaw_mode", _yaw_mode_label(options)),
+        ("yaw_offset_deg", f"{float(getattr(options, 'yaw_offset_deg', 0.0)):.2f}"),
+        ("yaw_invert", "on" if bool(getattr(options, "yaw_invert", False)) else "off"),
+        ("opacity_pct", f"{float(getattr(options, 'opacity_pct', 100.0)):.1f}"),
+        ("roi_warp", "on" if bool(getattr(options, "roi_warp", True)) else "off"),
+        ("roi_margin_px", str(int(getattr(options, "roi_margin_px", 8)))),
+        ("crop_optimize", "on" if bool(getattr(options, "crop_optimize", False)) else "off"),
+        ("use_pitch", "on" if bool(getattr(options, "use_pitch", False)) else "off"),
+        ("undistort", "on" if bool(getattr(options, "undistort", False)) else "off"),
+    ]
+    if bool(getattr(options, "undistort", False)):
+        items.extend(
+            [
+                ("k1", f"{float(getattr(options, 'k1', 0.1400)):.4f}"),
+                ("k2", f"{float(getattr(options, 'k2', -0.3979)):.4f}"),
+                ("k3", f"{float(getattr(options, 'k3', 0.4837)):.4f}"),
+            ]
+        )
+    if ext in (".jpg", ".jpeg"):
+        items.append(("jpg_quality", str(int(getattr(options, "jpg_quality", 95)))))
+    elif ext == ".png":
+        items.append(("png_compress_level", str(int(getattr(options, "png_compress_level", 6)))))
+
+    label_width = max((len(label) for label, _ in items), default=0)
+    lines = ["bvpp params"]
+    lines.extend(f"{label.ljust(label_width)} : {value}" for label, value in items)
+    return lines
+
+
+def _load_overlay_font(font_size: int):
+    candidates = [
+        "DejaVuSansMono.ttf",
+        "DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, font_size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _measure_overlay_text(
+    draw: ImageDraw.ImageDraw,
+    lines: List[str],
+    font,
+    spacing: int,
+) -> Tuple[int, int]:
+    text = "\n".join(lines)
+    try:
+        left, top, right, bottom = draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing)
+        return max(0, right - left), max(0, bottom - top)
+    except Exception:
+        widths: List[int] = []
+        heights: List[int] = []
+        for line in lines:
+            sample = line if line else " "
+            try:
+                left, top, right, bottom = draw.textbbox((0, 0), sample, font=font)
+                widths.append(max(0, right - left))
+                heights.append(max(0, bottom - top))
+            except Exception:
+                widths.append(0)
+                heights.append(0)
+        total_h = sum(heights)
+        if heights:
+            total_h += spacing * (len(heights) - 1)
+        return max(widths, default=0), total_h
+
+
+def _annotate_image_with_parameters(img: Image.Image, options: RenderOptions, out_path: str) -> None:
+    if img.width <= 0 or img.height <= 0:
+        return
+
+    lines = _build_parameter_overlay_lines(options, out_path)
+    draw = ImageDraw.Draw(img) if img.mode == "RGBA" else ImageDraw.Draw(img, "RGBA")
+    base_size = max(12, min(64, min(img.width, img.height) // 48))
+    font_size = base_size
+    font = _load_overlay_font(font_size)
+    text_w = text_h = 0
+    margin = padding = spacing = 0
+
+    while True:
+        font = _load_overlay_font(font_size)
+        margin = max(8, font_size // 2)
+        padding = max(6, font_size // 2)
+        spacing = max(2, font_size // 4)
+        text_w, text_h = _measure_overlay_text(draw, lines, font, spacing)
+        box_w = text_w + (padding * 2)
+        box_h = text_h + (padding * 2)
+        if (
+            font_size <= 12
+            or (box_w + margin <= img.width and box_h + margin <= img.height)
+        ):
+            break
+        font_size = max(12, font_size - 2)
+
+    x0 = margin
+    y0 = margin
+    x1 = min(img.width - 1, x0 + text_w + (padding * 2))
+    y1 = min(img.height - 1, y0 + text_h + (padding * 2))
+    if x1 <= x0 or y1 <= y0:
+        return
+
+    draw.rectangle((x0, y0, x1, y1), fill=(255, 255, 255, 208), outline=(0, 0, 0, 208))
+    draw.multiline_text(
+        (x0 + padding, y0 + padding),
+        "\n".join(lines),
+        fill=(0, 0, 0, 255),
+        font=font,
+        spacing=spacing,
+    )
+
+
 def _save_progress_metrics(state: SaveProgressState) -> Tuple[float, int, float]:
     start_time, bytes_written, _, _ = state.snapshot()
     elapsed = max(time.perf_counter() - start_time, 0.0)
@@ -214,6 +347,7 @@ def _save_image_job(img: Image.Image, out_path: str, options: RenderOptions, sta
         os.makedirs(out_dir, exist_ok=True)
 
     try:
+        _annotate_image_with_parameters(img, options, out_path)
         with open(out_path, "wb") as raw_fp:
             progress_fp = ProgressFileWrapper(raw_fp, state)
             _save_image_with_options(img, progress_fp, options, out_path_hint=out_path)
@@ -1183,16 +1317,16 @@ def _world_to_canvas(x: np.ndarray, y: np.ndarray, min_x: float, max_y: float, m
     return u, v
 
 
-def _undistort_rgba(im: Image.Image, k1: float) -> Image.Image:
-    """Simple radial undistortion with 1-parameter model.
+def _undistort_rgba(im: Image.Image, k1: float, k2: float, k3: float) -> Image.Image:
+    """Simple radial undistortion with 3-parameter model.
 
     This is a lightweight approximation:
-      r_d = r_u * (1 + k1*r_u^2)
+      r_d = r_u * (1 + k1*r_u^2 + k2*r_u^4 + k3*r_u^6)
     We compute inverse mapping (dst->src) to sample source.
 
-    k1 units are normalized to image half-diagonal (r in [0,1]).
+    k1/k2/k3 units are normalized to image half-diagonal (r in [0,1]).
     """
-    if abs(float(k1)) < 1e-12:
+    if all(abs(float(k)) < 1e-12 for k in (k1, k2, k3)):
         return im
 
     im = im.convert("RGBA")
@@ -1212,8 +1346,8 @@ def _undistort_rgba(im: Image.Image, k1: float) -> Image.Image:
     r2 = x * x + y * y
 
     # Inverse mapping: we want src coords for each dst pixel.
-    # Approximate inverse by dividing by (1 + k1*r^2).
-    scale = 1.0 + float(k1) * r2
+    # Approximate inverse by dividing by the radial polynomial.
+    scale = 1.0 + float(k1) * r2 + float(k2) * (r2 * r2) + float(k3) * (r2 * r2 * r2)
     scale = np.where(scale == 0, 1.0, scale)
     xu = x / scale
     yu = y / scale
@@ -1964,7 +2098,7 @@ def _warp_photo_to_canvas(
     with Image.open(meta.path) as im:
         im = im.convert("RGBA")
         if options.undistort:
-            im = _undistort_rgba(im, options.k1)
+            im = _undistort_rgba(im, options.k1, options.k2, options.k3)
         warped = im.transform(
             out_size,
             Image.AFFINE,
@@ -2037,8 +2171,20 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument(
         "--k1",
         type=float,
-        default=0.0,
-        help="radial distortion coefficient for --undistort (e.g., 0.05 barrel, -0.05 pincushion)",
+        default=0.1400,
+        help="radial distortion k1 coefficient for --undistort (default: 0.1400)",
+    )
+    ap.add_argument(
+        "--k2",
+        type=float,
+        default=-0.3979,
+        help="radial distortion k2 coefficient for --undistort (default: -0.3979)",
+    )
+    ap.add_argument(
+        "--k3",
+        type=float,
+        default=0.4837,
+        help="radial distortion k3 coefficient for --undistort (default: 0.4837)",
     )
     ap.add_argument(
         "--yaw-invert",
@@ -2374,7 +2520,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
                 with Image.open(p) as im:
                     im = im.convert("RGBA")
                     if self.options.undistort:
-                        im = _undistort_rgba(im, self.options.k1)
+                        im = _undistort_rgba(im, self.options.k1, self.options.k2, self.options.k3)
                     if s < 1.0:
                         nw = max(1, int(round(im.width * s)))
                         nh = max(1, int(round(im.height * s)))
@@ -2404,6 +2550,8 @@ class MosaicGUI(QtWidgets.QMainWindow):
         return RenderOptions(
             undistort=self.options.undistort,
             k1=self.options.k1,
+            k2=self.options.k2,
+            k3=self.options.k3,
             alt_correction_m=float(self.alt_correction_m_gui),
             yaw_offset_deg=float(self.yaw_offset_deg_gui),
             yaw_invert=self.yaw_invert,
@@ -3136,6 +3284,8 @@ class MosaicGUI(QtWidgets.QMainWindow):
         self.options = RenderOptions(
             undistort=self.options.undistort,
             k1=self.options.k1,
+            k2=self.options.k2,
+            k3=self.options.k3,
             alt_correction_m=float(self.alt_correction_m_gui),
             yaw_offset_deg=float(self.yaw_offset_deg_gui),
             yaw_invert=self.yaw_invert,
@@ -3183,7 +3333,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             if getattr(args, "gui", False):
                 launch_gui(args.in_dir, args.out, RenderOptions(
                     undistort=bool(getattr(args, "undistort", False)),
-                    k1=float(getattr(args, "k1", 0.0)),
+                    k1=float(getattr(args, "k1", 0.1400)),
+                    k2=float(getattr(args, "k2", -0.3979)),
+                    k3=float(getattr(args, "k3", 0.4837)),
                     alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
                     yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
                     yaw_invert=bool(getattr(args, "yaw_invert", False)),
@@ -3202,7 +3354,9 @@ def main(argv: Optional[List[str]] = None) -> None:
                 return
             opts = RenderOptions(
                 undistort=bool(getattr(args, "undistort", False)),
-                k1=float(getattr(args, "k1", 0.0)),
+                k1=float(getattr(args, "k1", 0.1400)),
+                k2=float(getattr(args, "k2", -0.3979)),
+                k3=float(getattr(args, "k3", 0.4837)),
                 alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
                 yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
                 yaw_invert=bool(getattr(args, "yaw_invert", False)),
