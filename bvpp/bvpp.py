@@ -24,6 +24,25 @@ CLI:
   --in   directory; all files inside are processed
   --out  output image path
 
+Notes (local):
+  "2025-11-21_kabukurinuma" --yaw-offset 0 --alt-correction -5.7 --yaw-invert --yaw-bothで合う > 代わりに--yaw-gimbal-onlyでもほぼok.
+    CameraのYawと逆方向に画像を回転させる必要がある。
+    --yaw-gimbal-onlyより--yaw-invertの方がやや良い感じだが、まあ許せる範囲。
+  "2025-12-29_inbanuma/" --out inba_060.jpg --alt-correction -2.5 --yaw-offset 260 --yaw-bothで合う > 代わりに--yaw-gimbal-onlyで解決！
+    CameraのYawと逆方向に画像を回転させた場合にYaw+60にする必要がある
+    CameraとYawを順方向回転とした場合はYaw-60くらい？
+  "2025-10-30_mikadsukinuma" --alt-correction 0 --yaw-offset 15 --yaw-bothで合う
+    > 代わりに--yaw-gimbal-onlyで左側はok。右はずれる。高度を変えても解決できない。謎。
+  "2020-12-28_natsume" は yaw-offset, alt, gimbal-only を何にしても合いにくい
+    --alt-correction 5 --yaw-offset -28くらいで力尽きた。左半分が合うと右が合わず、、、という感じ。
+
+Issues:
+    * ドローンが北を誤解している場合があるのではないか。
+    * 進行方向(Yaw)と逆方向に画像を回転させているが、それは間違い。同じ方向に回転させるべき。
+
+Dependencies:
+  pip install pillow numpy exifread
+  sudo apt install exiftool
 """
 
 from __future__ import annotations
@@ -239,12 +258,10 @@ def _build_parameter_overlay_lines(options: RenderOptions, out_path: str) -> Lis
 
 def _load_overlay_font(font_size: int):
     candidates = [
-        "DejaVuSansMono.ttf",
         "DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     ]
     for candidate in candidates:
         try:
@@ -288,39 +305,27 @@ def _annotate_image_with_parameters(img: Image.Image, options: RenderOptions, ou
 
     lines = _build_parameter_overlay_lines(options, out_path)
     draw = ImageDraw.Draw(img) if img.mode == "RGBA" else ImageDraw.Draw(img, "RGBA")
-    base_size = max(12, min(64, min(img.width, img.height) // 48))
-    font_size = base_size
+    font_size = 11
     font = _load_overlay_font(font_size)
-    text_w = text_h = 0
-    margin = padding = spacing = 0
-
-    while True:
-        font = _load_overlay_font(font_size)
-        margin = max(8, font_size // 2)
-        padding = max(6, font_size // 2)
-        spacing = max(2, font_size // 4)
-        text_w, text_h = _measure_overlay_text(draw, lines, font, spacing)
-        box_w = text_w + (padding * 2)
-        box_h = text_h + (padding * 2)
-        if (
-            font_size <= 12
-            or (box_w + margin <= img.width and box_h + margin <= img.height)
-        ):
-            break
-        font_size = max(12, font_size - 2)
+    margin = 8
+    padding = 4
+    spacing = 2
+    text_w, text_h = _measure_overlay_text(draw, lines, font, spacing)
+    box_w = text_w + (padding * 2)
+    box_h = text_h + (padding * 2)
 
     x0 = margin
-    y0 = margin
-    x1 = min(img.width - 1, x0 + text_w + (padding * 2))
-    y1 = min(img.height - 1, y0 + text_h + (padding * 2))
+    y0 = max(0, img.height - margin - box_h)
+    x1 = min(img.width - 1, x0 + box_w)
+    y1 = min(img.height - 1, y0 + box_h)
     if x1 <= x0 or y1 <= y0:
         return
 
-    draw.rectangle((x0, y0, x1, y1), fill=(255, 255, 255, 208), outline=(0, 0, 0, 208))
+    draw.rectangle((x0, y0, x1, y1), fill=(0, 0, 0, 255))
     draw.multiline_text(
         (x0 + padding, y0 + padding),
         "\n".join(lines),
-        fill=(0, 0, 0, 255),
+        fill=(255, 255, 255, 255),
         font=font,
         spacing=spacing,
     )
