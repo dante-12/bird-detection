@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Bird's-eye Photo Patchwork (bvpp)
+"""Drone Photo Mosaic / Bird View Pixel Processor (bvpp)
 
 Author: Naoki
 
@@ -24,25 +24,9 @@ CLI:
   --in   directory; all files inside are processed
   --out  output image path
 
-Notes (local):
-  "2025-11-21_kabukurinuma" --yaw-offset 0 --alt-correction -5.7 --yaw-invert --yaw-bothで合う > 代わりに--yaw-gimbal-onlyでもほぼok.
-    CameraのYawと逆方向に画像を回転させる必要がある。
-    --yaw-gimbal-onlyより--yaw-invertの方がやや良い感じだが、まあ許せる範囲。
-  "2025-12-29_inbanuma/" --out inba_060.jpg --alt-correction -2.5 --yaw-offset 260 --yaw-bothで合う > 代わりに--yaw-gimbal-onlyで解決！
-    CameraのYawと逆方向に画像を回転させた場合にYaw+60にする必要がある
-    CameraとYawを順方向回転とした場合はYaw-60くらい？
-  "2025-10-30_mikadsukinuma" --alt-correction 0 --yaw-offset 15 --yaw-bothで合う
-    > 代わりに--yaw-gimbal-onlyで左側はok。右はずれる。高度を変えても解決できない。謎。
-  "2020-12-28_natsume" は yaw-offset, alt, gimbal-only を何にしても合いにくい
-    --alt-correction 5 --yaw-offset -28くらいで力尽きた。左半分が合うと右が合わず、、、という感じ。
-
-Issues:
-    * ドローンが北を誤解している場合があるのではないか。
-    * 進行方向(Yaw)と逆方向に画像を回転させているが、それは間違い。同じ方向に回転させるべき。
-
 Dependencies:
-  pip install pillow numpy exifread
-  sudo apt install exiftool
+  pip install pillow numpy exifread PyQt6
+  sudo apt install exiftool libxcb-cursor0
 """
 
 from __future__ import annotations
@@ -50,6 +34,7 @@ from __future__ import annotations
 import argparse
 import gc
 import glob
+import mimetypes
 import io
 import json
 import math
@@ -57,8 +42,11 @@ import os
 import subprocess
 import sys
 import threading
+import webbrowser
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import BinaryIO, Dict, Iterable, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -75,11 +63,27 @@ try:
 except Exception:  # pragma: no cover
     resource = None
 
-# Optional GUI dependencies (PyQt6)
-try:
-    from PyQt6 import QtCore, QtGui, QtWidgets
-except ImportError:
-    QtCore = QtGui = QtWidgets = None
+# Optional GUI dependencies (PyQt6). Import lazily unless --gui was requested;
+# some incompatible Qt builds abort the interpreter at import time.
+class _QtWidgetsStub:
+    class QGraphicsView:
+        pass
+
+    class QMainWindow:
+        pass
+
+
+QT_AVAILABLE = False
+if "--gui" in sys.argv:
+    try:
+        from PyQt6 import QtCore, QtGui, QtWidgets
+        QT_AVAILABLE = True
+    except ImportError:
+        QtCore = QtGui = None
+        QtWidgets = _QtWidgetsStub
+else:
+    QtCore = QtGui = None
+    QtWidgets = _QtWidgetsStub
 
 # Pillowで巨大画像を扱う（必要なら制限解除）
 Image.MAX_IMAGE_PIXELS = None
@@ -157,6 +161,10 @@ class RenderOptions:
 
 class MemoryPressureError(RuntimeError):
     """Raised when the estimated memory demand is too close to the system limit."""
+
+
+class SaveCancelledError(RuntimeError):
+    """Raised when an interactive save job is cancelled by the user."""
 
 
 def _format_bytes_hr(num_bytes: float) -> str:
@@ -399,6 +407,73 @@ def _cgroup_memory_current_bytes() -> Optional[int]:
     return None
 
 
+def _sysctl_int(name: str) -> Optional[int]:
+    try:
+        proc = subprocess.run(
+            ["sysctl", "-n", name],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        return int(proc.stdout.strip())
+    except Exception:
+        return None
+
+
+def _macos_page_size_bytes() -> Optional[int]:
+    try:
+        size = int(os.sysconf("SC_PAGE_SIZE"))
+        if size > 0:
+            return size
+    except Exception:
+        pass
+    return _sysctl_int("hw.pagesize")
+
+
+def _macos_vm_stat_pages() -> Dict[str, int]:
+    pages: Dict[str, int] = {}
+    try:
+        proc = subprocess.run(
+            ["vm_stat"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return pages
+    except Exception:
+        return pages
+
+    for line in proc.stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        digits = "".join(ch for ch in raw_value if ch.isdigit())
+        if not digits:
+            continue
+        pages[key.strip()] = int(digits)
+    return pages
+
+
+def _macos_mem_available_bytes() -> Optional[int]:
+    page_size = _macos_page_size_bytes()
+    if page_size is None:
+        return None
+    pages = _macos_vm_stat_pages()
+    if not pages:
+        return None
+    available_pages = (
+        pages.get("Pages free", 0)
+        + pages.get("Pages inactive", 0)
+        + pages.get("Pages speculative", 0)
+    )
+    return int(available_pages) * int(page_size)
+
+
 def _system_mem_available_bytes() -> Optional[int]:
     try:
         with open("/proc/meminfo", "r", encoding="utf-8") as fh:
@@ -408,7 +483,24 @@ def _system_mem_available_bytes() -> Optional[int]:
                     if len(parts) >= 2:
                         return int(parts[1]) * 1024
     except Exception:
-        return None
+        pass
+    if sys.platform == "darwin":
+        return _macos_mem_available_bytes()
+    return None
+
+
+def _system_mem_total_bytes() -> Optional[int]:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        return _sysctl_int("hw.memsize")
     return None
 
 
@@ -2217,10 +2309,31 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="launch GUI for interactive adjustment (requires PyQt6)",
     )
     ap.add_argument(
+        "--webui",
+        action="store_true",
+        help="launch experimental WebUI for GPU-accelerated preview in a browser",
+    )
+    ap.add_argument(
+        "--webui-host",
+        default="127.0.0.1",
+        help="WebUI bind host (default: 127.0.0.1)",
+    )
+    ap.add_argument(
+        "--webui-port",
+        type=int,
+        default=8765,
+        help="WebUI bind port (default: 8765)",
+    )
+    ap.add_argument(
+        "--webui-debug",
+        action="store_true",
+        help="print WebUI HTTP request logs to stderr",
+    )
+    ap.add_argument(
         "--preview-max-pix",
         type=int,
-        default=2048,
-        help="GUI preview max width/height in pixels (default: 2048)",
+        default=3500,
+        help="GUI/WebUI preview max width/height in pixels (default: 3500)",
     )
     ap.add_argument(
         "--use-pitch",
@@ -2233,6 +2346,1373 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="save-only: in overlap, choose front pixel from image whose center is nearest",
     )
     return ap.parse_args(argv)
+
+
+# ============================================================================
+# Experimental WebUI Implementation
+# ============================================================================
+
+WEBUI_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bvpp WebUI</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; font-family: system-ui, -apple-system, Segoe UI, sans-serif; color: #202124; background: #f6f7f8; }
+    #app { display: grid; grid-template-rows: 1fr auto; height: 100%; }
+    #stageWrap { position: relative; min-height: 0; background: #e8ebee; }
+    #gl { display: block; width: 100%; height: 100%; }
+    #hud { position: absolute; left: 12px; top: 12px; min-width: 250px; padding: 8px 10px; border-radius: 6px; background: rgba(255,255,255,.88); box-shadow: 0 1px 6px rgba(0,0,0,.16); font-size: 12px; line-height: 1.35; pointer-events: none; }
+    .hud-lines { white-space: pre-line; }
+    .mem-row { margin-top: 6px; }
+    .mem-bar { width: 100%; height: 8px; margin-top: 3px; overflow: hidden; border-radius: 999px; background: #dfe3e8; }
+    .mem-fill { height: 100%; width: 0%; background: #188038; }
+    #modalBackdrop { position: fixed; inset: 0; z-index: 20; display: none; align-items: center; justify-content: center; background: rgba(32,33,36,.38); }
+    #modalBackdrop.active { display: flex; }
+    #opacityDialog { width: min(520px, calc(100vw - 32px)); padding: 18px; border-radius: 8px; background: #fff; box-shadow: 0 12px 36px rgba(0,0,0,.28); }
+    #opacityDialog h2 { margin: 0 0 8px; font-size: 16px; font-weight: 650; color: #202124; }
+    #opacityDialog p { margin: 0 0 14px; color: #5f6368; font-size: 13px; line-height: 1.45; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+    #controls { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; padding: 10px 12px; border-top: 1px solid #d0d4d8; background: #fff; max-height: 38vh; overflow: auto; }
+    fieldset { margin: 0; padding: 8px 10px 10px; border: 1px solid #d0d4d8; border-radius: 6px; min-width: 0; }
+    legend { padding: 0 4px; color: #3c4043; font-size: 12px; font-weight: 600; }
+    label { display: grid; gap: 4px; font-size: 12px; color: #5f6368; }
+    .control-stack { display: grid; gap: 8px; align-content: start; }
+    .control-row { display: flex; align-items: end; gap: 8px; }
+    .info-lines { white-space: pre-line; color: #5f6368; font-size: 12px; line-height: 1.35; }
+    .compact { min-width: 180px; }
+    .save-options { flex: 0 0 220px; width: 220px; max-width: 220px; }
+    .save-options .info-lines { white-space: normal; overflow-wrap: anywhere; }
+    .wide { min-width: 290px; max-width: 360px; }
+    input, select, button { font: inherit; }
+    input[type="text"] { width: 92px; padding: 5px 6px; }
+    input[type="range"] { width: 160px; }
+    select, button { padding: 6px 8px; }
+    button { cursor: pointer; border: 1px solid #b9c0c7; border-radius: 6px; background: #fff; }
+    button.primary { color: #fff; border-color: #1a73e8; background: #1a73e8; }
+    button:disabled { cursor: default; opacity: .55; }
+    .check { display: flex; align-items: center; gap: 6px; height: 30px; }
+    #status { min-width: 220px; font-size: 12px; color: #5f6368; }
+    #saveActivity { display: none; width: 220px; height: 16px; margin-top: 4px; overflow: hidden; border-radius: 999px; background: #eef2f7; position: relative; }
+    #saveActivity.active { display: block; }
+    #saveActivity::before { content: ">>>"; position: absolute; left: -42px; top: 0; color: #1a73e8; font-size: 13px; line-height: 16px; font-weight: 700; letter-spacing: 3px; animation: save-arrow-run 1.05s linear infinite; }
+    @keyframes save-arrow-run { from { transform: translateX(0); } to { transform: translateX(270px); } }
+    #tooltip { position: fixed; z-index: 10; display: none; max-width: 300px; padding: 7px 9px; border-radius: 6px; background: rgba(32,33,36,.92); color: #fff; font-size: 12px; line-height: 1.35; white-space: pre-line; pointer-events: none; box-shadow: 0 2px 10px rgba(0,0,0,.25); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="stageWrap">
+      <canvas id="gl" tabindex="0"></canvas>
+      <div id="hud">Loading...</div>
+      <div id="tooltip"></div>
+    </div>
+    <div id="controls">
+      <fieldset class="compact">
+        <legend>Camera-Water Distance</legend>
+        <div class="control-stack">
+          <label>Altitude Correction [m]<input id="alt" type="text" inputmode="decimal"></label>
+          <div id="cameraWaterInfo" class="info-lines"></div>
+        </div>
+      </fieldset>
+      <fieldset class="compact">
+        <legend>Relative Altitude (Exif) stats</legend>
+        <div id="relativeAltitudeInfo" class="info-lines"></div>
+      </fieldset>
+      <fieldset class="compact">
+        <legend>Rotation Correction</legend>
+        <label>Degree<input id="yaw" type="text" inputmode="decimal"></label>
+      </fieldset>
+      <fieldset class="compact">
+        <legend>Transparency (%)</legend>
+        <label>Opacity <input id="opacity" type="range" min="0" max="100"><span id="opacityText"></span></label>
+      </fieldset>
+      <fieldset class="wide">
+        <legend>Image Rotation Rule</legend>
+        <div class="control-stack">
+          <select id="yawMode"><option value="both">Use Flight + Gimbal Yaw Degree</option><option value="flight_only">Use Flight Yaw Degree</option><option value="gimbal_only">Use Gimbal Yaw Degree</option></select>
+          <label class="check"><input id="yawInvert" type="checkbox">Reverse rotate</label>
+          <div id="yawDescription" class="info-lines"></div>
+        </div>
+      </fieldset>
+      <fieldset class="compact save-options">
+        <legend>Save Options</legend>
+        <label class="check"><input id="cropOptimize" type="checkbox">Crop Optimize</label>
+        <div class="info-lines">When checked, mosaic saving uses the center area of each image as much as possible. This helps reduce blur near the edges of photos.</div>
+      </fieldset>
+      <fieldset class="compact">
+        <legend>Keyboard Shortcuts</legend>
+        <div id="shortcutInfo" class="info-lines"></div>
+      </fieldset>
+      <fieldset class="wide">
+        <legend>Exif Info</legend>
+        <div id="exifInfo" class="info-lines"></div>
+      </fieldset>
+      <fieldset class="compact">
+        <legend>Actions</legend>
+        <div class="control-stack">
+          <div class="control-row">
+            <button id="fit">Fit</button>
+            <button id="revert">Revert</button>
+            <button id="save" class="primary">Save</button>
+            <button id="cancelSave" disabled>Cancel</button>
+          </div>
+          <div id="status"></div>
+          <div id="saveActivity"></div>
+        </div>
+      </fieldset>
+    </div>
+  </div>
+  <div id="modalBackdrop">
+    <div id="opacityDialog" role="dialog" aria-modal="true" aria-labelledby="opacityDialogTitle">
+      <h2 id="opacityDialogTitle">Save with transparency?</h2>
+      <p id="opacityDialogMessage"></p>
+      <div class="dialog-actions">
+        <button id="opacityDialogSave" class="primary">Save</button>
+        <button id="opacityDialogSaveOpaque">Save without transparency</button>
+        <button id="opacityDialogCancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
+"""
+
+
+WEBUI_JS = r"""(() => {
+  const canvas = document.getElementById('gl');
+  const hud = document.getElementById('hud');
+  const tooltip = document.getElementById('tooltip');
+  const statusEl = document.getElementById('status');
+  const saveActivityEl = document.getElementById('saveActivity');
+  const altEl = document.getElementById('alt');
+  const yawEl = document.getElementById('yaw');
+  const yawModeEl = document.getElementById('yawMode');
+  const yawInvertEl = document.getElementById('yawInvert');
+  const opacityEl = document.getElementById('opacity');
+  const opacityTextEl = document.getElementById('opacityText');
+  const cropOptimizeEl = document.getElementById('cropOptimize');
+  const saveBtn = document.getElementById('save');
+  const cancelSaveBtn = document.getElementById('cancelSave');
+  const modalBackdrop = document.getElementById('modalBackdrop');
+  const opacityDialogTitle = document.getElementById('opacityDialogTitle');
+  const opacityDialogMessage = document.getElementById('opacityDialogMessage');
+  const opacityDialogSave = document.getElementById('opacityDialogSave');
+  const opacityDialogSaveOpaque = document.getElementById('opacityDialogSaveOpaque');
+  const opacityDialogCancel = document.getElementById('opacityDialogCancel');
+  const cameraWaterInfoEl = document.getElementById('cameraWaterInfo');
+  const relativeAltitudeInfoEl = document.getElementById('relativeAltitudeInfo');
+  const yawDescriptionEl = document.getElementById('yawDescription');
+  const shortcutInfoEl = document.getElementById('shortcutInfo');
+  const exifInfoEl = document.getElementById('exifInfo');
+  const gl = canvas.getContext('webgl', { antialias: true, alpha: false });
+  if (!gl) {
+    hud.textContent = 'WebGL is not available in this browser.';
+    return;
+  }
+
+  const vs = `
+    attribute vec2 a_pos;
+    attribute vec2 a_uv;
+    uniform vec2 u_canvas;
+    uniform vec2 u_view;
+    uniform float u_zoom;
+    uniform vec2 u_pan;
+    varying vec2 v_uv;
+    void main() {
+      vec2 p = (a_pos - u_pan) * u_zoom;
+      vec2 clip = vec2((p.x / u_view.x) * 2.0 - 1.0, 1.0 - (p.y / u_view.y) * 2.0);
+      gl_Position = vec4(clip, 0.0, 1.0);
+      v_uv = a_uv;
+    }`;
+  const fs = `
+    precision mediump float;
+    varying vec2 v_uv;
+    uniform sampler2D u_tex;
+    uniform float u_opacity;
+    void main() {
+      vec4 c = texture2D(u_tex, v_uv);
+      gl_FragColor = vec4(c.rgb, c.a * u_opacity);
+    }`;
+
+  function shader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const program = gl.createProgram();
+  gl.attachShader(program, shader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(program, shader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+  gl.useProgram(program);
+
+  const loc = {
+    pos: gl.getAttribLocation(program, 'a_pos'),
+    uv: gl.getAttribLocation(program, 'a_uv'),
+    canvas: gl.getUniformLocation(program, 'u_canvas'),
+    view: gl.getUniformLocation(program, 'u_view'),
+    zoom: gl.getUniformLocation(program, 'u_zoom'),
+    pan: gl.getUniformLocation(program, 'u_pan'),
+    opacity: gl.getUniformLocation(program, 'u_opacity'),
+  };
+  const posBuf = gl.createBuffer();
+  const uvBuf = gl.createBuffer();
+  const uvData = new Float32Array([0,0, 1,0, 1,1, 0,0, 1,1, 0,1]);
+  gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, uvData, gl.STATIC_DRAW);
+
+  let state = null;
+  let layers = [];
+  let zoom = 1;
+  let pan = [0, 0];
+  let dragging = false;
+  let lastMouse = [0, 0];
+  let loadGeneration = 0;
+  let savePollTimer = null;
+  let memoryPollTimer = null;
+  let memoryPollInterval = 0;
+  let memoryInfo = null;
+  let shutdownSent = false;
+
+  function setStatus(text) { statusEl.textContent = text || ''; }
+  function notifyServerShutdown() {
+    if (shutdownSent) return;
+    shutdownSent = true;
+    try {
+      navigator.sendBeacon('/api/shutdown', new Blob(['{}'], { type: 'application/json' }));
+    } catch (err) {
+      try {
+        fetch('/api/shutdown', { method: 'POST', keepalive: true, headers: {'Content-Type': 'application/json'}, body: '{}' });
+      } catch (_) {}
+    }
+  }
+  function setSaveActive(active, cancellable = active) {
+    saveBtn.disabled = !!active;
+    cancelSaveBtn.disabled = !cancellable;
+    saveActivityEl.classList.toggle('active', !!active);
+    setMemoryPolling(active ? 1000 : 5000);
+  }
+  function setLines(el, lines) {
+    if (!el) return;
+    el.textContent = Array.isArray(lines) ? lines.join('\n') : String(lines || '');
+  }
+  function updateInfo() {
+    if (!state || !state.info) return;
+    setLines(cameraWaterInfoEl, state.info.camera_water_lines);
+    setLines(relativeAltitudeInfoEl, state.info.relative_altitude_lines);
+    setLines(yawDescriptionEl, state.info.yaw_description_lines);
+    setLines(shortcutInfoEl, state.info.shortcut_lines);
+    setLines(exifInfoEl, state.info.exif_lines);
+  }
+  function photoById(id) {
+    if (!state || !state.photos) return null;
+    return state.photos.find(photo => photo.id === id) || null;
+  }
+  function fmtNum(value) {
+    return Number.isFinite(Number(value)) ? Number(value).toFixed(2) : 'N/A';
+  }
+  function tooltipText(photo) {
+    return `${photo.name}\n` +
+      `Relative Altitude [m]: ${fmtNum(photo.alt_m)}\n` +
+      `Flight Pitch [degree]: ${fmtNum(photo.flight_pitch_deg)}\n` +
+      `Gimbal Pitch [degree]: ${fmtNum(photo.gimbal_pitch_deg)}\n` +
+      `Flight Yaw Degree: ${fmtNum(photo.flight_yaw_deg)}\n` +
+      `Gimbal Yaw Degree: ${fmtNum(photo.gimbal_yaw_deg)}`;
+  }
+  function pointInTri(px, py, a, b, c) {
+    const v0x = c[0] - a[0], v0y = c[1] - a[1];
+    const v1x = b[0] - a[0], v1y = b[1] - a[1];
+    const v2x = px - a[0], v2y = py - a[1];
+    const dot00 = v0x * v0x + v0y * v0y;
+    const dot01 = v0x * v1x + v0y * v1y;
+    const dot02 = v0x * v2x + v0y * v2y;
+    const dot11 = v1x * v1x + v1y * v1y;
+    const dot12 = v1x * v2x + v1y * v2y;
+    const denom = dot00 * dot11 - dot01 * dot01;
+    if (Math.abs(denom) < 1e-9) return false;
+    const inv = 1 / denom;
+    const u = (dot11 * dot02 - dot01 * dot12) * inv;
+    const v = (dot00 * dot12 - dot01 * dot02) * inv;
+    return u >= 0 && v >= 0 && (u + v) <= 1;
+  }
+  function pointInPhoto(px, py, photo) {
+    const c = photo.corners;
+    if (!c || c.length < 4) return false;
+    return pointInTri(px, py, c[0], c[1], c[2]) || pointInTri(px, py, c[0], c[2], c[3]);
+  }
+  function hideTooltip() {
+    tooltip.style.display = 'none';
+  }
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[ch]));
+  }
+  function formatGb(bytes) {
+    const gb = Number(bytes) / (1024 * 1024 * 1024);
+    if (!Number.isFinite(gb)) return 'unknown';
+    return `${Math.max(0.1, gb).toFixed(1)} GB`;
+  }
+  function showTooltip(ev, text) {
+    tooltip.textContent = text;
+    tooltip.style.display = 'block';
+    const pad = 12;
+    const x = Math.min(window.innerWidth - tooltip.offsetWidth - pad, ev.clientX + pad);
+    const y = Math.min(window.innerHeight - tooltip.offsetHeight - pad, ev.clientY + pad);
+    tooltip.style.left = `${Math.max(pad, x)}px`;
+    tooltip.style.top = `${Math.max(pad, y)}px`;
+  }
+  function chooseOpacitySaveMode(opacity) {
+    return new Promise(resolve => {
+      opacityDialogTitle.textContent = 'Save with transparency?';
+      opacityDialogMessage.textContent = `Opacity is currently ${opacity}%. Choose how to save the mosaic.`;
+      opacityDialogSave.textContent = 'Save';
+      opacityDialogSaveOpaque.textContent = 'Save without transparency';
+      opacityDialogSaveOpaque.style.display = '';
+      opacityDialogCancel.textContent = 'Cancel';
+      modalBackdrop.classList.add('active');
+      function cleanup(result) {
+        modalBackdrop.classList.remove('active');
+        opacityDialogSave.removeEventListener('click', onSave);
+        opacityDialogSaveOpaque.removeEventListener('click', onSaveOpaque);
+        opacityDialogCancel.removeEventListener('click', onCancel);
+        modalBackdrop.removeEventListener('click', onBackdrop);
+        window.removeEventListener('keydown', onKey);
+        resolve(result);
+      }
+      function onSave() { cleanup('save'); }
+      function onSaveOpaque() { cleanup('opaque'); }
+      function onCancel() { cleanup('cancel'); }
+      function onBackdrop(ev) {
+        if (ev.target === modalBackdrop) cleanup('cancel');
+      }
+      function onKey(ev) {
+        if (ev.key === 'Escape') cleanup('cancel');
+      }
+      opacityDialogSave.addEventListener('click', onSave);
+      opacityDialogSaveOpaque.addEventListener('click', onSaveOpaque);
+      opacityDialogCancel.addEventListener('click', onCancel);
+      modalBackdrop.addEventListener('click', onBackdrop);
+      window.addEventListener('keydown', onKey);
+      opacityDialogSave.focus();
+    });
+  }
+  function chooseMemoryForceSave(shortageBytes) {
+    return new Promise(resolve => {
+      opacityDialogTitle.textContent = 'Insufficient memory may be';
+      opacityDialogMessage.textContent = `There may be about ${formatGb(shortageBytes)} less available memory than required for saving. A shortage of around 5 GB may still be possible to run, but anything beyond that depends on the situation. Do you want to continue?`;
+      opacityDialogSave.textContent = 'Force Save';
+      opacityDialogSaveOpaque.style.display = 'none';
+      opacityDialogCancel.textContent = 'Cancel';
+      modalBackdrop.classList.add('active');
+      function cleanup(result) {
+        modalBackdrop.classList.remove('active');
+        opacityDialogSaveOpaque.style.display = '';
+        opacityDialogSave.removeEventListener('click', onForce);
+        opacityDialogCancel.removeEventListener('click', onCancel);
+        modalBackdrop.removeEventListener('click', onBackdrop);
+        window.removeEventListener('keydown', onKey);
+        resolve(result);
+      }
+      function onForce() { cleanup('force'); }
+      function onCancel() { cleanup('cancel'); }
+      function onBackdrop(ev) {
+        if (ev.target === modalBackdrop) cleanup('cancel');
+      }
+      function onKey(ev) {
+        if (ev.key === 'Escape') cleanup('cancel');
+      }
+      opacityDialogSave.addEventListener('click', onForce);
+      opacityDialogCancel.addEventListener('click', onCancel);
+      modalBackdrop.addEventListener('click', onBackdrop);
+      window.addEventListener('keydown', onKey);
+      opacityDialogSave.focus();
+    });
+  }
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+    const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    draw();
+  }
+  function fit() {
+    if (!state) return;
+    zoom = Math.min(canvas.width / state.canvas.width, canvas.height / state.canvas.height) * 0.96;
+    zoom = Math.max(zoom, 0.0001);
+    pan = [
+      (state.canvas.width - canvas.width / zoom) / 2,
+      (state.canvas.height - canvas.height / zoom) / 2,
+    ];
+    draw();
+  }
+  function makeTexture(img) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    return tex;
+  }
+  function loadImage(url) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = url;
+    });
+  }
+  function posData(c) {
+    return new Float32Array([
+      c[0][0], c[0][1], c[1][0], c[1][1], c[2][0], c[2][1],
+      c[0][0], c[0][1], c[2][0], c[2][1], c[3][0], c[3][1],
+    ]);
+  }
+  async function rebuildLayers() {
+    const generation = ++loadGeneration;
+    const photosToLoad = [...state.photos];
+    layers.forEach(l => gl.deleteTexture(l.texture));
+    layers = [];
+    setStatus(`Loading ${photosToLoad.length} textures...`);
+    let loaded = 0;
+    for (const p of photosToLoad) {
+      if (generation !== loadGeneration) return;
+      try {
+        const img = await loadImage(p.url);
+        if (generation !== loadGeneration) return;
+        const latest = photoById(p.id) || p;
+        layers.push({ id: p.id, texture: makeTexture(img), pos: posData(latest.corners), name: p.name });
+        loaded += 1;
+        setStatus(`Loaded ${loaded}/${photosToLoad.length} textures`);
+        draw();
+      } catch (err) {
+        console.warn('Image load failed', p.url, err);
+      }
+    }
+    setStatus(`Ready: ${loaded}/${photosToLoad.length} textures`);
+  }
+  function updateLayerGeometry() {
+    const byId = new Map(layers.map(layer => [layer.id, layer]));
+    const next = [];
+    for (const p of state.photos) {
+      const layer = byId.get(p.id);
+      if (!layer) continue;
+      layer.pos = posData(p.corners);
+      next.push(layer);
+    }
+    layers = next;
+    return true;
+  }
+  function draw() {
+    if (!state) return;
+    gl.clearColor(1, 1, 1, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(program);
+    gl.uniform2f(loc.canvas, state.canvas.width, state.canvas.height);
+    gl.uniform2f(loc.view, canvas.width, canvas.height);
+    gl.uniform1f(loc.zoom, zoom);
+    gl.uniform2f(loc.pan, pan[0], pan[1]);
+    gl.uniform1f(loc.opacity, (state.options.opacity_pct || 100) / 100);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+    gl.enableVertexAttribArray(loc.uv);
+    gl.vertexAttribPointer(loc.uv, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(loc.pos);
+    for (const layer of layers) {
+      gl.bindTexture(gl.TEXTURE_2D, layer.texture);
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, layer.pos, gl.STATIC_DRAW);
+      gl.vertexAttribPointer(loc.pos, 2, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+    const previewW = Math.round(state.canvas.width);
+    const previewH = Math.round(state.canvas.height);
+    const full = state.full_canvas || {};
+    const saveW = Math.round(full.width || 0);
+    const saveH = Math.round(full.height || 0);
+    const mem = full.estimated_memory || 'N/A';
+    const memTotal = memoryInfo && memoryInfo.total ? memoryInfo.total : 'N/A';
+    const memAvailable = memoryInfo && memoryInfo.available ? memoryInfo.available : 'N/A';
+    const memLabel = memoryInfo && memoryInfo.is_wsl ? ' (WSL)' : '';
+    const memPct = memoryInfo && Number.isFinite(Number(memoryInfo.available_pct)) ? Math.max(0, Math.min(100, Number(memoryInfo.available_pct))) : 0;
+    const lines = `bvpp WebUI\n${state.photos.length} photos\npreview ${previewW} x ${previewH} px\nsave ${saveW} x ${saveH} px\nestimated memory required for saving ${mem}\nzoom ${(zoom * 100).toFixed(1)}%`;
+    hud.innerHTML =
+      `<div class="hud-lines">${escapeHtml(lines)}</div>` +
+      `<div class="mem-row">physical memory${memLabel} ${escapeHtml(memTotal)}<br>available memory${memLabel} ${escapeHtml(memAvailable)}</div>` +
+      `<div class="mem-bar"><div class="mem-fill" style="width:${memPct.toFixed(1)}%"></div></div>`;
+  }
+  async function updateMemoryInfo() {
+    try {
+      const res = await fetch('/api/memory');
+      memoryInfo = await res.json();
+      draw();
+    } catch (err) {
+      memoryInfo = null;
+      draw();
+    }
+  }
+  function setMemoryPolling(intervalMs) {
+    if (memoryPollInterval === intervalMs && memoryPollTimer) return;
+    if (memoryPollTimer) clearInterval(memoryPollTimer);
+    memoryPollInterval = intervalMs;
+    memoryPollTimer = setInterval(updateMemoryInfo, intervalMs);
+  }
+  function syncControlsFromState() {
+    altEl.value = state.options.alt_correction_m;
+    yawEl.value = state.options.yaw_offset_deg;
+    yawModeEl.value = state.options.yaw_mode;
+    yawInvertEl.checked = !!state.options.yaw_invert;
+    opacityEl.value = state.options.opacity_pct;
+    opacityTextEl.textContent = `${Math.round(state.options.opacity_pct)}%`;
+    cropOptimizeEl.checked = !!state.options.crop_optimize;
+    updateInfo();
+  }
+  async function loadState(refit = false) {
+    const res = await fetch('/api/state');
+    state = await res.json();
+    syncControlsFromState();
+    if (refit) fit();
+    await rebuildLayers();
+    if (refit) fit();
+    draw();
+  }
+  async function updateOptions(reloadTextures = false) {
+    opacityTextEl.textContent = `${opacityEl.value}%`;
+    const payload = {
+      alt_correction_m: parseFloat(altEl.value || '0'),
+      yaw_offset_deg: parseFloat(yawEl.value || '0'),
+      yaw_mode: yawModeEl.value,
+      yaw_invert: yawInvertEl.checked,
+      opacity_pct: parseFloat(opacityEl.value || '100'),
+      crop_optimize: cropOptimizeEl.checked,
+    };
+    setStatus('Updating geometry...');
+    const res = await fetch('/api/options', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+    state = await res.json();
+    syncControlsFromState();
+    if (reloadTextures || !updateLayerGeometry()) {
+      await rebuildLayers();
+    } else {
+      setStatus('Ready: geometry updated');
+    }
+    draw();
+  }
+  let optionTimer = null;
+  function scheduleOptions(reloadTextures = false) {
+    clearTimeout(optionTimer);
+    optionTimer = setTimeout(() => updateOptions(reloadTextures), 160);
+  }
+  function numericValue(el, fallback = 0) {
+    const value = parseFloat(el.value);
+    return Number.isFinite(value) ? value : fallback;
+  }
+  function setNumericValue(el, value) {
+    el.value = Number(value).toFixed(2);
+  }
+  function focusStage() {
+    canvas.focus({ preventScroll: true });
+  }
+  function isTypingTarget(target) {
+    if (!target) return false;
+    const tag = String(target.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || target.isContentEditable;
+  }
+  window.addEventListener('keydown', (ev) => {
+    if (ev.defaultPrevented || ev.altKey || ev.ctrlKey || ev.metaKey || isTypingTarget(ev.target)) return;
+    const key = ev.key.toLowerCase();
+    if (key === 'h') {
+      setNumericValue(altEl, numericValue(altEl) + 0.2);
+    } else if (key === 'j') {
+      setNumericValue(altEl, numericValue(altEl) - 0.2);
+    } else if (key === 'k') {
+      setNumericValue(yawEl, numericValue(yawEl) + 2.0);
+    } else if (key === 'l') {
+      setNumericValue(yawEl, numericValue(yawEl) - 2.0);
+    } else {
+      return;
+    }
+    ev.preventDefault();
+    scheduleOptions(false);
+  });
+  [altEl, yawEl, yawModeEl, yawInvertEl, cropOptimizeEl].forEach(el => el.addEventListener('input', () => scheduleOptions(false)));
+  opacityEl.addEventListener('input', () => {
+    opacityTextEl.textContent = `${opacityEl.value}%`;
+    if (state) state.options.opacity_pct = parseFloat(opacityEl.value || '100');
+    draw();
+    scheduleOptions(false);
+  });
+  opacityEl.addEventListener('change', focusStage);
+  opacityEl.addEventListener('pointerup', focusStage);
+  yawModeEl.addEventListener('change', focusStage);
+  yawInvertEl.addEventListener('change', focusStage);
+  cropOptimizeEl.addEventListener('change', focusStage);
+  document.getElementById('fit').addEventListener('click', fit);
+  document.getElementById('revert').addEventListener('click', async () => {
+    setStatus('Reverting...');
+    const res = await fetch('/api/revert', { method: 'POST' });
+    state = await res.json();
+    syncControlsFromState();
+    await rebuildLayers();
+    fit();
+    draw();
+    setStatus('Reverted to original');
+  });
+  function renderSaveStatus(payload) {
+    if (!payload || !payload.active) {
+      if (payload && payload.error) setStatus(`Save failed: ${payload.error}`);
+      setSaveActive(false);
+      return false;
+    }
+    if (payload.status === 'running') {
+      setSaveActive(true, true);
+      const pct = payload.total ? Math.round((payload.done / payload.total) * 100) : 0;
+      const filePart = payload.current ? `: ${payload.current}` : '';
+      setStatus(`${payload.phase} ${pct}% (${payload.done}/${payload.total})${filePart}`);
+      return true;
+    }
+    if (payload.status === 'saving') {
+      setSaveActive(true, false);
+      setStatus(payload.save_text || 'Saving...');
+      return true;
+    }
+    if (payload.status === 'done') {
+      setSaveActive(false);
+      setStatus(`Saved: ${payload.path}`);
+      return false;
+    }
+    if (payload.status === 'cancelled') {
+      setSaveActive(false);
+      setStatus('Save cancelled');
+      return false;
+    }
+    setSaveActive(false);
+    setStatus(`Save failed: ${payload.error || 'unknown error'}`);
+    return false;
+  }
+  async function pollSaveStatus() {
+    try {
+      const res = await fetch('/api/save-status');
+      const payload = await res.json();
+      const keepPolling = renderSaveStatus(payload);
+      if (!keepPolling && savePollTimer) {
+        clearInterval(savePollTimer);
+        savePollTimer = null;
+      }
+    } catch (err) {
+      setStatus(`Save status failed: ${err}`);
+      setSaveActive(false);
+      if (savePollTimer) {
+        clearInterval(savePollTimer);
+        savePollTimer = null;
+      }
+    }
+  }
+  document.getElementById('save').addEventListener('click', async () => {
+    let forceSave = false;
+    await updateMemoryInfo();
+    const requiredBytes = Number(state && state.full_canvas ? state.full_canvas.estimated_memory_bytes : NaN);
+    const marginBytes = Number(state && state.full_canvas ? state.full_canvas.memory_safety_margin_bytes : 0);
+    const availableBytes = Number(memoryInfo ? memoryInfo.available_bytes : NaN);
+    const shortageBytes = requiredBytes + marginBytes - availableBytes;
+    if (Number.isFinite(shortageBytes) && shortageBytes > 0) {
+      const choice = await chooseMemoryForceSave(shortageBytes);
+      if (choice === 'cancel') return;
+      forceSave = true;
+    }
+    const opacity = parseFloat(opacityEl.value || '100');
+    if (Number.isFinite(opacity) && opacity < 100) {
+      const choice = await chooseOpacitySaveMode(opacity);
+      if (choice === 'cancel') return;
+      if (choice === 'opaque') {
+        opacityEl.value = '100';
+        opacityTextEl.textContent = '100%';
+        if (state) state.options.opacity_pct = 100;
+        draw();
+        await updateOptions(false);
+      }
+    }
+    setStatus('Starting full-resolution mosaic save...');
+    setSaveActive(true);
+    try {
+      const res = await fetch('/api/save', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({force: forceSave}),
+      });
+      const payload = await res.json();
+      const keepPolling = renderSaveStatus(payload);
+      if (keepPolling && !savePollTimer) {
+        savePollTimer = setInterval(pollSaveStatus, 500);
+      }
+      if (keepPolling) pollSaveStatus();
+    } catch (err) {
+      setStatus(`Save start failed: ${err}`);
+      setSaveActive(false);
+    }
+  });
+  cancelSaveBtn.addEventListener('click', async () => {
+    setStatus('Cancelling save...');
+    await fetch('/api/cancel-save', { method: 'POST' });
+    pollSaveStatus();
+  });
+  canvas.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    const oldZoom = zoom;
+    const factor = ev.deltaY < 0 ? 1.12 : 1 / 1.12;
+    zoom = Math.min(64, Math.max(0.0001, zoom * factor));
+    const rect = canvas.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) * (canvas.width / rect.width);
+    const y = (ev.clientY - rect.top) * (canvas.height / rect.height);
+    pan[0] += x / oldZoom - x / zoom;
+    pan[1] += y / oldZoom - y / zoom;
+    draw();
+  }, { passive: false });
+  canvas.addEventListener('mousedown', ev => { dragging = true; lastMouse = [ev.clientX, ev.clientY]; });
+  window.addEventListener('mouseup', () => { dragging = false; });
+  window.addEventListener('mousemove', ev => {
+    if (!dragging) {
+      if (!state || !state.photos) {
+        hideTooltip();
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const sx = canvas.width / rect.width;
+      const sy = canvas.height / rect.height;
+      const px = pan[0] + ((ev.clientX - rect.left) * sx) / zoom;
+      const py = pan[1] + ((ev.clientY - rect.top) * sy) / zoom;
+      let found = null;
+      for (let i = state.photos.length - 1; i >= 0; i -= 1) {
+        const photo = state.photos[i];
+        if (pointInPhoto(px, py, photo)) {
+          found = photo;
+          break;
+        }
+      }
+      if (found) showTooltip(ev, tooltipText(found)); else hideTooltip();
+      return;
+    }
+    hideTooltip();
+    const rect = canvas.getBoundingClientRect();
+    const sx = canvas.width / rect.width;
+    const sy = canvas.height / rect.height;
+    pan[0] -= (ev.clientX - lastMouse[0]) * sx / zoom;
+    pan[1] -= (ev.clientY - lastMouse[1]) * sy / zoom;
+    lastMouse = [ev.clientX, ev.clientY];
+    draw();
+  });
+  window.addEventListener('resize', resize);
+  window.addEventListener('pagehide', notifyServerShutdown);
+  window.addEventListener('beforeunload', notifyServerShutdown);
+  canvas.addEventListener('mouseleave', hideTooltip);
+  resize();
+  setMemoryPolling(5000);
+  updateMemoryInfo();
+  loadState(true).catch(err => {
+    console.error(err);
+    hud.textContent = String(err);
+  });
+})();"""
+
+
+def _render_options_from_args(args: argparse.Namespace) -> RenderOptions:
+    return RenderOptions(
+        undistort=bool(getattr(args, "undistort", False)),
+        k1=float(getattr(args, "k1", 0.1400)),
+        k2=float(getattr(args, "k2", -0.3979)),
+        k3=float(getattr(args, "k3", 0.4837)),
+        alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
+        yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
+        yaw_invert=bool(getattr(args, "yaw_invert", False)),
+        yaw_both=bool(getattr(args, "yaw_both", False)),
+        yaw_gimbal_only=bool(getattr(args, "yaw_gimbal_only", False)),
+        yaw_flight_only=bool(getattr(args, "yaw_flight_only", False)),
+        opacity_pct=float(getattr(args, "opacity", 100.0)),
+        roi_warp=not bool(getattr(args, "no_roi_warp", False)),
+        roi_margin_px=int(getattr(args, "roi_margin", 8)),
+        jpg_quality=int(getattr(args, "jpg_quality", 95)),
+        png_compress_level=int(getattr(args, "png_compress_level", 6)),
+        preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
+        use_pitch=bool(getattr(args, "use_pitch", False)),
+        crop_optimize=bool(getattr(args, "crop_optimize", False)),
+    )
+
+
+def _copy_options(
+    options: RenderOptions,
+    *,
+    alt_correction_m: Optional[float] = None,
+    yaw_offset_deg: Optional[float] = None,
+    yaw_mode: Optional[str] = None,
+    yaw_invert: Optional[bool] = None,
+    opacity_pct: Optional[float] = None,
+    crop_optimize: Optional[bool] = None,
+) -> RenderOptions:
+    mode = yaw_mode or _webui_yaw_mode(options)
+    return RenderOptions(
+        undistort=options.undistort,
+        k1=options.k1,
+        k2=options.k2,
+        k3=options.k3,
+        alt_correction_m=options.alt_correction_m if alt_correction_m is None else float(alt_correction_m),
+        yaw_offset_deg=options.yaw_offset_deg if yaw_offset_deg is None else float(yaw_offset_deg),
+        yaw_invert=options.yaw_invert if yaw_invert is None else bool(yaw_invert),
+        yaw_both=(mode == "both"),
+        yaw_gimbal_only=(mode == "gimbal_only"),
+        yaw_flight_only=(mode == "flight_only"),
+        opacity_pct=options.opacity_pct if opacity_pct is None else max(0.0, min(100.0, float(opacity_pct))),
+        roi_warp=options.roi_warp,
+        roi_margin_px=options.roi_margin_px,
+        jpg_quality=options.jpg_quality,
+        png_compress_level=options.png_compress_level,
+        preview_max_dim=options.preview_max_dim,
+        use_pitch=options.use_pitch,
+        crop_optimize=options.crop_optimize if crop_optimize is None else bool(crop_optimize),
+    )
+
+
+def _webui_yaw_mode(options: RenderOptions) -> str:
+    if bool(getattr(options, "yaw_gimbal_only", False)):
+        return "gimbal_only"
+    if bool(getattr(options, "yaw_both", False)):
+        return "both"
+    return "flight_only"
+
+
+def _stats_line(values: List[Optional[float]]) -> str:
+    nums = [float(v) for v in values if v is not None]
+    if not nums:
+        return "N/A"
+    return f"avg={float(np.mean(nums)):.2f}, min={float(np.min(nums)):.2f}, max={float(np.max(nums)):.2f}"
+
+
+def _first_text_or_na(values: List[Optional[str]]) -> str:
+    for v in values:
+        if v is not None:
+            s = str(v).strip()
+            if s:
+                return s
+    return "N/A"
+
+
+def _build_ui_info(metas: List[PhotoMeta], options: RenderOptions) -> Dict[str, List[str]]:
+    if not metas:
+        return {
+            "camera_water_lines": ["Avg. Camera-Water Distance: 0.00 m"],
+            "relative_altitude_lines": ["Avg: 0.00 m", "Min: 0.00 m", "Max: 0.00 m"],
+            "yaw_description_lines": [
+                "Flight Yaw Degree = Drone direction (Exif)",
+                "Gimbal Yaw Degree = Gimbal direction (Exif)",
+            ],
+            "shortcut_lines": ["H: Altitude +0.2m", "J: Altitude -0.2m", "K: Rotation +2 deg", "L: Rotation -2 deg"],
+            "exif_lines": ["No EXIF stats available"],
+        }
+
+    rel_vals = [float(m.alt_m) for m in metas]
+    rel_avg = float(np.mean(rel_vals))
+    rel_min = float(np.min(rel_vals))
+    rel_max = float(np.max(rel_vals))
+    cam_water_avg = rel_avg + float(getattr(options, "alt_correction_m", 0.0))
+
+    fov_vals = [float(m.hfov_deg) for m in metas]
+    fov_avg = float(np.mean(fov_vals))
+    fov_min = float(np.min(fov_vals))
+    fov_max = float(np.max(fov_vals))
+    if (fov_max - fov_min) <= 1e-3:
+        fov_line = f"FOV [deg]: {fov_avg:.2f} (uniform)"
+    else:
+        fov_line = f"FOV [deg]: mismatch detected (avg={fov_avg:.2f}, min={fov_min:.2f}, max={fov_max:.2f})"
+
+    return {
+        "camera_water_lines": [f"Avg. Camera-Water Distance: {cam_water_avg:.2f} m"],
+        "relative_altitude_lines": [
+            f"Avg: {rel_avg:.2f} m",
+            f"Min: {rel_min:.2f} m",
+            f"Max: {rel_max:.2f} m",
+        ],
+        "yaw_description_lines": [
+            "Flight Yaw Degree = Drone direction (Exif)",
+            "Gimbal Yaw Degree = Gimbal direction (Exif)",
+        ],
+        "shortcut_lines": [
+            "H: Altitude +0.2m",
+            "J: Altitude -0.2m",
+            "K: Rotation +2 deg",
+            "L: Rotation -2 deg",
+        ],
+        "exif_lines": [
+            "Product Name: " + _first_text_or_na([getattr(m, "product_name", None) for m in metas]),
+            "Unique Camera Model: " + _first_text_or_na([getattr(m, "unique_camera_model", None) for m in metas]),
+            fov_line,
+            "Flight Pitch [deg]: " + _stats_line([getattr(m, "flight_pitch_deg", None) for m in metas]),
+            "Gimbal Pitch [deg]: " + _stats_line([getattr(m, "gimbal_pitch_deg", None) for m in metas]),
+            "Gimbal Roll [deg]: " + _stats_line([getattr(m, "gimbal_roll_deg", None) for m in metas]),
+            "Flight Roll [deg]: " + _stats_line([getattr(m, "flight_roll_deg", None) for m in metas]),
+            "Flight Yaw [deg]: " + _stats_line([getattr(m, "flight_yaw_deg", None) for m in metas]),
+            "Gimbal Yaw [deg]: " + _stats_line([getattr(m, "gimbal_yaw_deg", None) for m in metas]),
+        ],
+    }
+
+
+@dataclass
+class WebSaveJob:
+    total: int
+    done: int = 0
+    current: str = ""
+    phase: str = "Preparing"
+    status: str = "running"
+    path: str = ""
+    error: Optional[str] = None
+    save_state: SaveProgressState = field(default_factory=SaveProgressState)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def update(
+        self,
+        *,
+        phase: Optional[str] = None,
+        done: Optional[int] = None,
+        current: Optional[str] = None,
+        status: Optional[str] = None,
+        path: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        with self.lock:
+            if phase is not None:
+                self.phase = phase
+            if done is not None:
+                self.done = int(done)
+            if current is not None:
+                self.current = current
+            if status is not None:
+                self.status = status
+            if path is not None:
+                self.path = path
+            if error is not None:
+                self.error = error
+
+    def check_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise SaveCancelledError("Save cancelled")
+
+    def snapshot(self) -> Dict[str, object]:
+        with self.lock:
+            payload = {
+                "active": True,
+                "status": self.status,
+                "phase": self.phase,
+                "done": self.done,
+                "total": self.total,
+                "current": self.current,
+                "path": self.path,
+                "error": self.error,
+            }
+        payload["save_text"] = _format_save_progress_text(self.save_state)
+        return payload
+
+
+class WebMosaicSession:
+    def __init__(self, in_dir: str, out_path: str, options: RenderOptions):
+        self.in_dir = in_dir
+        self.out_path = out_path
+        self.initial_options = options
+        self.options = options
+        self.lock = threading.Lock()
+        self.save_job: Optional[WebSaveJob] = None
+        self.image_paths: List[str] = []
+        self.metas: List[PhotoMeta] = []
+        self._reload_metas()
+
+    def _reload_metas(self) -> None:
+        paths = _list_images(self.in_dir)
+        metas: List[PhotoMeta] = []
+        image_paths: List[str] = []
+        for p in paths:
+            try:
+                meta = _load_photo_meta(p, self.options)
+            except Exception:
+                meta = None
+            if meta is None:
+                continue
+            image_paths.append(p)
+            metas.append(meta)
+        if not metas:
+            raise SystemExit("No usable images found.")
+        self.image_paths = image_paths
+        self.metas = metas
+
+    def update_options(self, payload: Dict[str, object]) -> Dict[str, object]:
+        with self.lock:
+            old_mode = _webui_yaw_mode(self.options)
+            old_invert = bool(self.options.yaw_invert)
+            self.options = _copy_options(
+                self.options,
+                alt_correction_m=float(payload.get("alt_correction_m", self.options.alt_correction_m)),
+                yaw_offset_deg=float(payload.get("yaw_offset_deg", self.options.yaw_offset_deg)),
+                yaw_mode=str(payload.get("yaw_mode", old_mode)),
+                yaw_invert=bool(payload.get("yaw_invert", old_invert)),
+                opacity_pct=float(payload.get("opacity_pct", self.options.opacity_pct)),
+                crop_optimize=bool(payload.get("crop_optimize", self.options.crop_optimize)),
+            )
+            if old_mode != _webui_yaw_mode(self.options) or old_invert != bool(self.options.yaw_invert):
+                self._reload_metas()
+            return self.state()
+
+    def revert_options(self) -> Dict[str, object]:
+        with self.lock:
+            self.options = self.initial_options
+            self._reload_metas()
+            return self.state()
+
+    def state(self) -> Dict[str, object]:
+        if not self.metas:
+            self._reload_metas()
+        origin_lat, origin_lon, min_x, min_y, max_x, max_y, mpp = _compute_canvas(self.metas, self.options)
+        canvas_w = int(math.ceil((max_x - min_x) / mpp))
+        canvas_h = int(math.ceil((max_y - min_y) / mpp))
+        preview_max = max(64, int(getattr(self.options, "preview_max_dim", 2048)))
+        scale = min(1.0, preview_max / max(canvas_w, canvas_h))
+        use_crop_opt = bool(getattr(self.options, "crop_optimize", False))
+        canvas_memory = _estimated_canvas_memory_bytes(canvas_w, canvas_h, self.out_path, use_crop_opt)
+        peak_photo_memory = 0 if not self.metas else max(
+            _estimate_photo_peak_bytes(meta, canvas_w, canvas_h, mpp, self.options) for meta in self.metas
+        )
+        estimated_memory = canvas_memory + peak_photo_memory
+        photos: List[Dict[str, object]] = []
+        ordered = sorted(enumerate(self.metas), key=lambda item: _effective_alt_m(item[1], self.options), reverse=True)
+        for idx, meta in ordered:
+            corners_world = _project_corners(meta, origin_lat, origin_lon, self.options)
+            u, v = _world_to_canvas(
+                corners_world[:, 0],
+                corners_world[:, 1],
+                min_x=min_x,
+                max_y=max_y,
+                mpp=mpp,
+            )
+            corners = [[float(u[i]) * scale, float(v[i]) * scale] for i in range(4)]
+            photos.append(
+                {
+                    "id": idx,
+                    "name": os.path.basename(meta.path),
+                    "url": f"/image/{idx}",
+                    "corners": corners,
+                    "width": meta.w,
+                    "height": meta.h,
+                    "alt_m": meta.alt_m,
+                    "yaw_deg": meta.yaw_deg,
+                    "flight_pitch_deg": meta.flight_pitch_deg,
+                    "gimbal_pitch_deg": meta.gimbal_pitch_deg,
+                    "flight_yaw_deg": meta.flight_yaw_deg,
+                    "gimbal_yaw_deg": meta.gimbal_yaw_deg,
+                }
+            )
+        return {
+            "canvas": {"width": canvas_w * scale, "height": canvas_h * scale, "scale": scale},
+            "full_canvas": {
+                "width": canvas_w,
+                "height": canvas_h,
+                "mpp": mpp,
+                "estimated_memory_bytes": estimated_memory,
+                "estimated_memory": _format_bytes_hr(estimated_memory),
+                "memory_safety_margin_bytes": MEMORY_SAFETY_MARGIN_BYTES,
+            },
+            "options": {
+                "alt_correction_m": self.options.alt_correction_m,
+                "yaw_offset_deg": self.options.yaw_offset_deg,
+                "yaw_mode": _webui_yaw_mode(self.options),
+                "yaw_invert": self.options.yaw_invert,
+                "opacity_pct": self.options.opacity_pct,
+                "undistort": self.options.undistort,
+                "crop_optimize": self.options.crop_optimize,
+            },
+            "info": _build_ui_info(self.metas, self.options),
+            "photos": photos,
+            "warnings": ["WebUI preview does not apply undistortion yet."] if self.options.undistort else [],
+        }
+
+    def image_response(self, image_id: int) -> Tuple[bytes, str]:
+        if image_id < 0 or image_id >= len(self.image_paths):
+            raise FileNotFoundError(f"image id not found: {image_id}")
+        path = self.image_paths[image_id]
+        with open(path, "rb") as fh:
+            data = fh.read()
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return data, mime
+
+    def save(self, force: bool = False) -> Dict[str, object]:
+        with self.lock:
+            if self.save_job is not None and self.save_job.snapshot().get("status") in ("running", "saving"):
+                return self.save_job.snapshot()
+            save_opts = self.options
+            metas = list(self.metas)
+            job = WebSaveJob(total=max(1, len(metas)))
+            self.save_job = job
+        thread = threading.Thread(target=self._run_save_job, args=(job, metas, save_opts, force), daemon=True)
+        thread.start()
+        return job.snapshot()
+
+    def save_status(self) -> Dict[str, object]:
+        job = self.save_job
+        if job is None:
+            return {"active": False}
+        return job.snapshot()
+
+    def memory_status(self) -> Dict[str, object]:
+        total = _system_mem_total_bytes()
+        available = _memory_headroom_bytes()
+        pct = 0.0
+        if total is not None and total > 0 and available is not None:
+            pct = max(0.0, min(100.0, (float(available) / float(total)) * 100.0))
+        return {
+            "total_bytes": total,
+            "available_bytes": available,
+            "total": "N/A" if total is None else _format_bytes_hr(total),
+            "available": "N/A" if available is None else _format_bytes_hr(available),
+            "available_pct": pct,
+            "is_wsl": _is_wsl(),
+        }
+
+    def cancel_save(self) -> Dict[str, object]:
+        job = self.save_job
+        if job is None:
+            return {"active": False}
+        job.cancel_event.set()
+        return job.snapshot()
+
+    def _run_save_job(
+        self,
+        job: WebSaveJob,
+        metas: List[PhotoMeta],
+        save_opts: RenderOptions,
+        force: bool = False,
+    ) -> None:
+        try:
+            job.check_cancelled()
+            job.update(phase="Computing canvas", done=0, current="")
+            origin_lat, origin_lon, min_x, min_y, max_x, max_y, mpp = _compute_canvas(metas, save_opts)
+            canvas_w = int(math.ceil((max_x - min_x) / mpp))
+            canvas_h = int(math.ceil((max_y - min_y) / mpp))
+            _ensure_output_dimension_limit(self.out_path, canvas_w, canvas_h)
+            if not force:
+                _ensure_save_memory_headroom(canvas_w, canvas_h, self.out_path, metas, save_opts, mpp)
+
+            job.check_cancelled()
+            base = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+            metas_sorted = sorted(metas, key=lambda m: _effective_alt_m(m, save_opts), reverse=True)
+            job.total = max(1, len(metas_sorted))
+            use_crop_opt = bool(getattr(save_opts, "crop_optimize", False))
+            best_dist2: Optional[np.ndarray] = None
+            if use_crop_opt:
+                best_dist2 = np.full((canvas_h, canvas_w), np.inf, dtype=np.float32)
+
+            for i, meta in enumerate(metas_sorted):
+                job.check_cancelled()
+                fname = os.path.basename(meta.path)
+                job.update(phase="Processing", done=i, current=fname)
+                if not force:
+                    _ensure_memory_headroom(
+                        _estimate_photo_peak_bytes(meta, canvas_w, canvas_h, mpp, save_opts),
+                        context=f"processing {fname}",
+                        margin_bytes=MEMORY_SAFETY_MARGIN_BYTES // 2,
+                    )
+                warped, offset = _warp_photo_to_canvas(
+                    meta,
+                    origin_lat=origin_lat,
+                    origin_lon=origin_lon,
+                    min_x=min_x,
+                    max_y=max_y,
+                    mpp_out=mpp,
+                    canvas_w=canvas_w,
+                    canvas_h=canvas_h,
+                    options=save_opts,
+                )
+                job.check_cancelled()
+                if use_crop_opt and best_dist2 is not None:
+                    cu, cv = _photo_center_canvas_xy(
+                        meta,
+                        origin_lat=origin_lat,
+                        origin_lon=origin_lon,
+                        min_x=min_x,
+                        max_y=max_y,
+                        mpp_out=mpp,
+                        options=save_opts,
+                    )
+                    _composite_nearest_center_rgba_inplace(base, best_dist2, warped, offset, cu, cv)
+                else:
+                    _alpha_blend_rgba_over_rgba_inplace(base, warped, offset)
+                del warped
+                job.update(done=i + 1, current=fname)
+
+            job.check_cancelled()
+            job.update(phase="Saving", status="saving", done=job.total, current="")
+            _save_image_job(base, self.out_path, save_opts, job.save_state)
+            job.update(status="done", phase="Done", path=os.path.abspath(self.out_path), current="")
+        except SaveCancelledError as exc:
+            job.update(status="cancelled", phase="Cancelled", error=str(exc))
+        except BaseException as exc:
+            job.update(status="error", phase="Error", error=str(exc))
+        finally:
+            gc.collect()
+
+
+def _make_webui_handler(session: WebMosaicSession, debug: bool = False):
+    class WebUIHandler(BaseHTTPRequestHandler):
+        server_version = "bvpp-webui/0.1"
+
+        def log_message(self, fmt: str, *args) -> None:
+            if debug:
+                sys.stderr.write("[webui] " + (fmt % args) + "\n")
+
+        def _send(self, status: int, data: bytes, content_type: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _json(self, payload: Dict[str, object], status: int = 200) -> None:
+            self._send(status, json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8")
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path == "/":
+                self._send(200, WEBUI_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if parsed.path == "/app.js":
+                self._send(200, WEBUI_JS.encode("utf-8"), "application/javascript; charset=utf-8")
+                return
+            if parsed.path == "/api/state":
+                with session.lock:
+                    self._json(session.state())
+                return
+            if parsed.path == "/api/save-status":
+                self._json(session.save_status())
+                return
+            if parsed.path == "/api/memory":
+                self._json(session.memory_status())
+                return
+            if parsed.path.startswith("/image/"):
+                try:
+                    image_id = int(parsed.path.rsplit("/", 1)[-1])
+                    data, mime = session.image_response(image_id)
+                    self._send(200, data, mime)
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 404)
+                return
+            self._json({"ok": False, "error": "not found"}, 404)
+
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                payload = {}
+            if parsed.path == "/api/options":
+                try:
+                    self._json(session.update_options(payload))
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            if parsed.path == "/api/revert":
+                try:
+                    self._json(session.revert_options())
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 400)
+                return
+            if parsed.path == "/api/save":
+                try:
+                    self._json(session.save(force=bool(payload.get("force", False))))
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 500)
+                return
+            if parsed.path == "/api/save-status":
+                self._json(session.save_status())
+                return
+            if parsed.path == "/api/cancel-save":
+                self._json(session.cancel_save())
+                return
+            if parsed.path == "/api/shutdown":
+                self._json({"ok": True})
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+            self._json({"ok": False, "error": "not found"}, 404)
+
+    return WebUIHandler
+
+
+def _is_wsl() -> bool:
+    if "WSL_DISTRO_NAME" in os.environ or "WSL_INTEROP" in os.environ:
+        return True
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="ignore") as fh:
+            version = fh.read().lower()
+        return "microsoft" in version or "wsl" in version
+    except Exception:
+        return False
+
+
+def _open_webui_url(url: str) -> None:
+    if _is_wsl():
+        for cmd_exe in ("cmd.exe", "/mnt/c/Windows/System32/cmd.exe"):
+            try:
+                subprocess.Popen(
+                    [cmd_exe, "/C", "start", "", url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            except Exception:
+                pass
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+def launch_webui(
+    in_dir: str,
+    out_path: str,
+    options: RenderOptions,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    debug: bool = False,
+) -> None:
+    session = WebMosaicSession(in_dir, out_path, options)
+    last_error: Optional[BaseException] = None
+    httpd: Optional[ThreadingHTTPServer] = None
+    for candidate in range(int(port), int(port) + 20):
+        try:
+            httpd = ThreadingHTTPServer((host, candidate), _make_webui_handler(session, debug=debug))
+            port = candidate
+            break
+        except OSError as exc:
+            last_error = exc
+    if httpd is None:
+        raise SystemExit(f"Failed to start WebUI server: {last_error}")
+
+    url = f"http://{host}:{port}/"
+    sys.stderr.write(f"bvpp WebUI ready: {url}\n")
+    _open_webui_url(url)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        sys.stderr.write("Stopping WebUI.\n")
+    finally:
+        httpd.server_close()
 
 
 # ============================================================================
@@ -2446,7 +3926,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
     def __init__(self, in_dir: str, out_path: str, options: RenderOptions):
         super().__init__()
         
-        if QtWidgets is None:
+        if not QT_AVAILABLE:
             raise RuntimeError("PyQt6 not available. Install with: pip install PyQt6")
         
         self.in_dir = in_dir
@@ -2904,40 +4384,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             self.exif_stats_label.setText("No EXIF stats available")
             return
 
-        def _stats(values: List[Optional[float]]) -> str:
-            nums = [float(v) for v in values if v is not None]
-            if not nums:
-                return "N/A"
-            return f"avg={float(np.mean(nums)):.2f}, min={float(np.min(nums)):.2f}, max={float(np.max(nums)):.2f}"
-
-        def _first_text(values: List[Optional[str]]) -> str:
-            for v in values:
-                if v is not None:
-                    s = str(v).strip()
-                    if s:
-                        return s
-            return "N/A"
-
-        fov_vals = [float(m.hfov_deg) for m in self.metas]
-        fov_avg = float(np.mean(fov_vals))
-        fov_min = float(np.min(fov_vals))
-        fov_max = float(np.max(fov_vals))
-        if (fov_max - fov_min) <= 1e-3:
-            fov_line = f"FOV [deg]: {fov_avg:.2f} (uniform)"
-        else:
-            fov_line = f"FOV [deg]: mismatch detected (avg={fov_avg:.2f}, min={fov_min:.2f}, max={fov_max:.2f})"
-
-        fp_line = "Flight Pitch [deg]: " + _stats([getattr(m, "flight_pitch_deg", None) for m in self.metas])
-        gp_line = "Gimbal Pitch [deg]: " + _stats([getattr(m, "gimbal_pitch_deg", None) for m in self.metas])
-        gr_line = "Gimbal Roll [deg]: " + _stats([getattr(m, "gimbal_roll_deg", None) for m in self.metas])
-        fr_line = "Flight Roll [deg]: " + _stats([getattr(m, "flight_roll_deg", None) for m in self.metas])
-        fy_line = "Flight Yaw [deg]: " + _stats([getattr(m, "flight_yaw_deg", None) for m in self.metas])
-        gy_line = "Gimbal Yaw [deg]: " + _stats([getattr(m, "gimbal_yaw_deg", None) for m in self.metas])
-        product_line = "Product Name: " + _first_text([getattr(m, "product_name", None) for m in self.metas])
-        model_line = "Unique Camera Model: " + _first_text([getattr(m, "unique_camera_model", None) for m in self.metas])
-        self.exif_stats_label.setText(
-            "\n".join([product_line, model_line, fov_line, fp_line, gp_line, gr_line, fr_line, fy_line, gy_line])
-        )
+        self.exif_stats_label.setText("\n".join(_build_ui_info(self.metas, self._get_current_options())["exif_lines"]))
 
     def _refresh_metas_for_current_yaw(self) -> None:
         """Reload PhotoMeta list with current yaw rules.
@@ -3313,7 +4760,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
 
 def launch_gui(in_dir: str, out_path: str, options: RenderOptions) -> None:
     """Launch the GUI application."""
-    if QtWidgets is None:
+    if not QT_AVAILABLE:
         raise SystemExit("PyQt6 not installed. Install with: pip install PyQt6")
     
     app = QtWidgets.QApplication(sys.argv)
@@ -3335,48 +4782,20 @@ def main(argv: Optional[List[str]] = None) -> None:
             if getattr(args, "inspect_only", False):
                 inspect_directory(args.in_dir)
                 return
-            if getattr(args, "gui", False):
-                launch_gui(args.in_dir, args.out, RenderOptions(
-                    undistort=bool(getattr(args, "undistort", False)),
-                    k1=float(getattr(args, "k1", 0.1400)),
-                    k2=float(getattr(args, "k2", -0.3979)),
-                    k3=float(getattr(args, "k3", 0.4837)),
-                    alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
-                    yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
-                    yaw_invert=bool(getattr(args, "yaw_invert", False)),
-                    yaw_both=bool(getattr(args, "yaw_both", False)),
-                    yaw_gimbal_only=bool(getattr(args, "yaw_gimbal_only", False)),
-                    yaw_flight_only=bool(getattr(args, "yaw_flight_only", False)),
-                    opacity_pct=float(getattr(args, "opacity", 100.0)),
-                    roi_warp=not bool(getattr(args, "no_roi_warp", False)),
-                    roi_margin_px=int(getattr(args, "roi_margin", 8)),
-                    jpg_quality=int(getattr(args, "jpg_quality", 95)),
-                    png_compress_level=int(getattr(args, "png_compress_level", 6)),
-                    preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
-                    use_pitch=bool(getattr(args, "use_pitch", False)),
-                    crop_optimize=bool(getattr(args, "crop_optimize", False)),
-                ))
+            opts = _render_options_from_args(args)
+            if getattr(args, "webui", False):
+                launch_webui(
+                    args.in_dir,
+                    args.out,
+                    opts,
+                    host=str(getattr(args, "webui_host", "127.0.0.1")),
+                    port=int(getattr(args, "webui_port", 8765)),
+                    debug=bool(getattr(args, "webui_debug", False)),
+                )
                 return
-            opts = RenderOptions(
-                undistort=bool(getattr(args, "undistort", False)),
-                k1=float(getattr(args, "k1", 0.1400)),
-                k2=float(getattr(args, "k2", -0.3979)),
-                k3=float(getattr(args, "k3", 0.4837)),
-                alt_correction_m=float(getattr(args, "alt_correction", 0.0)),
-                yaw_offset_deg=float(getattr(args, "yaw_offset", 0.0)),
-                yaw_invert=bool(getattr(args, "yaw_invert", False)),
-                yaw_both=bool(getattr(args, "yaw_both", False)),
-                yaw_gimbal_only=bool(getattr(args, "yaw_gimbal_only", False)),
-                yaw_flight_only=bool(getattr(args, "yaw_flight_only", False)),
-                opacity_pct=float(getattr(args, "opacity", 100.0)),
-                roi_warp=not bool(getattr(args, "no_roi_warp", False)),
-                roi_margin_px=int(getattr(args, "roi_margin", 8)),
-                jpg_quality=int(getattr(args, "jpg_quality", 95)),
-                png_compress_level=int(getattr(args, "png_compress_level", 6)),
-                preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
-                use_pitch=bool(getattr(args, "use_pitch", False)),
-                crop_optimize=bool(getattr(args, "crop_optimize", False)),
-            )
+            if getattr(args, "gui", False):
+                launch_gui(args.in_dir, args.out, opts)
+                return
             mosaic(args.in_dir, args.out, opts)
         except MemoryPressureError as e:
             raise SystemExit(str(e))
