@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import BinaryIO, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -135,6 +136,7 @@ class PhotoMeta:
     flight_roll_deg: Optional[float] = None
     product_name: Optional[str] = None
     unique_camera_model: Optional[str] = None
+    captured_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -861,6 +863,18 @@ def _read_exiftool_json(path: str) -> Dict[str, object]:
     if v is not None:
         out["Unique Camera Model"] = v
 
+    v = _first(
+        "Composite:SubSecDateTimeOriginal",
+        "EXIF:DateTimeOriginal",
+        "EXIF:CreateDate",
+        "EXIF:ModifyDate",
+        "DateTimeOriginal",
+        "CreateDate",
+        "ModifyDate",
+    )
+    if v is not None:
+        out["Date Time Original"] = v
+
     return out
 
 
@@ -1165,6 +1179,27 @@ def _extract_fov(tags: Dict[str, object], w: int, h: int) -> Optional[float]:
     return None
 
 
+def _extract_capture_time(tags: Dict[str, object]) -> Optional[str]:
+    value = _extract_first_text(
+        tags,
+        (
+            "Date Time Original",
+            "EXIF DateTimeOriginal",
+            "Image DateTime",
+            "EXIF:DateTimeOriginal",
+            "EXIF:CreateDate",
+            "EXIF:ModifyDate",
+            "Composite:SubSecDateTimeOriginal",
+            "DateTimeOriginal",
+            "CreateDate",
+            "ModifyDate",
+        ),
+    )
+    if value is None:
+        return None
+    return str(value).strip()
+
+
 def _approx_hfov_from_dfov(dfov_deg: float, w: int, h: int) -> float:
     # Convert diagonal FOV to horizontal FOV using aspect ratio.
     # tan(dfov/2)^2 = tan(hfov/2)^2 + tan(vfov/2)^2, and tan(vfov/2)=tan(hfov/2)/ar
@@ -1209,6 +1244,7 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
             "UniqueCameraModel",
         ),
     )
+    captured_at = _extract_capture_time(tags)
 
     if (
         (flight_pitch is not None and abs(float(flight_pitch)) > 25.0)
@@ -1269,6 +1305,7 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
         flight_roll_deg=float(flight_roll) if flight_roll is not None else None,
         product_name=product_name,
         unique_camera_model=unique_camera_model,
+        captured_at=captured_at,
     )
 
 
@@ -2362,8 +2399,15 @@ WEBUI_HTML = """<!doctype html>
     html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; font-family: system-ui, -apple-system, Segoe UI, sans-serif; color: #202124; background: #f6f7f8; }
     #app { display: grid; grid-template-rows: 1fr auto; height: 100%; }
     #stageWrap { position: relative; min-height: 0; background: #e8ebee; }
-    #gl { display: block; width: 100%; height: 100%; }
-    #hud { position: absolute; left: 12px; top: 12px; min-width: 250px; padding: 8px 10px; border-radius: 6px; background: rgba(255,255,255,.88); box-shadow: 0 1px 6px rgba(0,0,0,.16); font-size: 12px; line-height: 1.35; pointer-events: none; }
+    #basemap, #gl, #overlay { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+    #basemap, #overlay { pointer-events: none; }
+    #hudStack { position: absolute; left: 12px; top: 12px; display: grid; gap: 6px; pointer-events: none; }
+    #hud { min-width: 250px; padding: 8px 10px; border-radius: 6px; background: rgba(255,255,255,.88); box-shadow: 0 1px 6px rgba(0,0,0,.16); font-size: 12px; line-height: 1.35; }
+    #saveStatusPanel { display: none; min-width: 250px; max-width: 360px; padding: 7px 10px; border-radius: 6px; background: rgba(255,255,255,.9); box-shadow: 0 1px 6px rgba(0,0,0,.16); }
+    #saveStatusPanel.active, #saveStatusPanel.has-status { display: block; }
+    #scaleIndicator { position: absolute; left: 12px; bottom: 10px; display: none; min-width: 72px; padding: 5px 7px 6px; border-radius: 5px; background: rgba(255,255,255,.86); box-shadow: 0 1px 5px rgba(0,0,0,.16); color: #202124; font-size: 12px; line-height: 1; pointer-events: none; }
+    #scaleIndicator .scale-label { margin-bottom: 4px; text-align: center; font-weight: 600; }
+    #scaleIndicator .scale-bar { height: 6px; border: solid #202124; border-width: 0 2px 2px; box-sizing: border-box; }
     .hud-lines { white-space: pre-line; }
     .mem-row { margin-top: 6px; }
     .mem-bar { width: 100%; height: 8px; margin-top: 3px; overflow: hidden; border-radius: 999px; background: #dfe3e8; }
@@ -2374,7 +2418,12 @@ WEBUI_HTML = """<!doctype html>
     #opacityDialog h2 { margin: 0 0 8px; font-size: 16px; font-weight: 650; color: #202124; }
     #opacityDialog p { margin: 0 0 14px; color: #5f6368; font-size: 13px; line-height: 1.45; }
     .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
-    #controls { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; padding: 10px 12px; border-top: 1px solid #d0d4d8; background: #fff; max-height: 38vh; overflow: auto; }
+    #controls { display: grid; gap: 8px; padding: 8px 12px 10px; border-top: 1px solid #d0d4d8; background: #fff; max-height: 38vh; overflow: auto; }
+    .tabs { display: flex; gap: 4px; align-items: center; border-bottom: 1px solid #e1e5e9; }
+    .tab-button { margin: 0 0 -1px; padding: 7px 10px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; color: #5f6368; background: transparent; font-size: 12px; font-weight: 600; }
+    .tab-button.active { color: #1a73e8; border-bottom-color: #1a73e8; background: #f8fbff; }
+    .tab-panel { display: none; flex-wrap: wrap; align-items: stretch; gap: 10px; min-width: 0; }
+    .tab-panel.active { display: flex; }
     fieldset { margin: 0; padding: 8px 10px 10px; border: 1px solid #d0d4d8; border-radius: 6px; min-width: 0; }
     legend { padding: 0 4px; color: #3c4043; font-size: 12px; font-weight: 600; }
     label { display: grid; gap: 4px; font-size: 12px; color: #5f6368; }
@@ -2385,83 +2434,139 @@ WEBUI_HTML = """<!doctype html>
     .save-options { flex: 0 0 220px; width: 220px; max-width: 220px; }
     .save-options .info-lines { white-space: normal; overflow-wrap: anywhere; }
     .wide { min-width: 290px; max-width: 360px; }
+    .exif-group { flex: 1 1 180px; min-width: 170px; }
+    .exif-product { flex-basis: 260px; }
     input, select, button { font: inherit; }
     input[type="text"] { width: 92px; padding: 5px 6px; }
     input[type="range"] { width: 160px; }
     select, button { padding: 6px 8px; }
     button { cursor: pointer; border: 1px solid #b9c0c7; border-radius: 6px; background: #fff; }
-    button.primary { color: #fff; border-color: #1a73e8; background: #1a73e8; }
     button:disabled { cursor: default; opacity: .55; }
     .check { display: flex; align-items: center; gap: 6px; height: 30px; }
-    #status { min-width: 220px; font-size: 12px; color: #5f6368; }
-    #saveActivity { display: none; width: 220px; height: 16px; margin-top: 4px; overflow: hidden; border-radius: 999px; background: #eef2f7; position: relative; }
+    .radio-stack { display: grid; gap: 5px; padding-left: 18px; }
+    .attribution { color: #5f6368; font-size: 11px; line-height: 1.3; }
+    #status { min-width: 220px; font-size: 12px; color: #5f6368; overflow-wrap: anywhere; }
+    #saveActivity { display: none; width: 100%; height: 16px; margin-top: 4px; overflow: hidden; border-radius: 999px; background: #eef2f7; position: relative; }
     #saveActivity.active { display: block; }
     #saveActivity::before { content: ">>>"; position: absolute; left: -42px; top: 0; color: #1a73e8; font-size: 13px; line-height: 16px; font-weight: 700; letter-spacing: 3px; animation: save-arrow-run 1.05s linear infinite; }
     @keyframes save-arrow-run { from { transform: translateX(0); } to { transform: translateX(270px); } }
-    #tooltip { position: fixed; z-index: 10; display: none; max-width: 300px; padding: 7px 9px; border-radius: 6px; background: rgba(32,33,36,.92); color: #fff; font-size: 12px; line-height: 1.35; white-space: pre-line; pointer-events: none; box-shadow: 0 2px 10px rgba(0,0,0,.25); }
+    #tooltip { position: fixed; z-index: 10; display: none; max-width: 360px; padding: 8px 10px; border-radius: 6px; background: rgba(32,33,36,.92); color: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.45; white-space: pre; pointer-events: none; box-shadow: 0 2px 10px rgba(0,0,0,.25); }
   </style>
 </head>
 <body>
   <div id="app">
     <div id="stageWrap">
+      <canvas id="basemap"></canvas>
       <canvas id="gl" tabindex="0"></canvas>
-      <div id="hud">Loading...</div>
-      <div id="tooltip"></div>
-    </div>
-    <div id="controls">
-      <fieldset class="compact">
-        <legend>Camera-Water Distance</legend>
-        <div class="control-stack">
-          <label>Altitude Correction [m]<input id="alt" type="text" inputmode="decimal"></label>
-          <div id="cameraWaterInfo" class="info-lines"></div>
-        </div>
-      </fieldset>
-      <fieldset class="compact">
-        <legend>Relative Altitude (Exif) stats</legend>
-        <div id="relativeAltitudeInfo" class="info-lines"></div>
-      </fieldset>
-      <fieldset class="compact">
-        <legend>Rotation Correction</legend>
-        <label>Degree<input id="yaw" type="text" inputmode="decimal"></label>
-      </fieldset>
-      <fieldset class="compact">
-        <legend>Transparency (%)</legend>
-        <label>Opacity <input id="opacity" type="range" min="0" max="100"><span id="opacityText"></span></label>
-      </fieldset>
-      <fieldset class="wide">
-        <legend>Image Rotation Rule</legend>
-        <div class="control-stack">
-          <select id="yawMode"><option value="both">Use Flight + Gimbal Yaw Degree</option><option value="flight_only">Use Flight Yaw Degree</option><option value="gimbal_only">Use Gimbal Yaw Degree</option></select>
-          <label class="check"><input id="yawInvert" type="checkbox">Reverse rotate</label>
-          <div id="yawDescription" class="info-lines"></div>
-        </div>
-      </fieldset>
-      <fieldset class="compact save-options">
-        <legend>Save Options</legend>
-        <label class="check"><input id="cropOptimize" type="checkbox">Crop Optimize</label>
-        <div class="info-lines">When checked, mosaic saving uses the center area of each image as much as possible. This helps reduce blur near the edges of photos.</div>
-      </fieldset>
-      <fieldset class="compact">
-        <legend>Keyboard Shortcuts</legend>
-        <div id="shortcutInfo" class="info-lines"></div>
-      </fieldset>
-      <fieldset class="wide">
-        <legend>Exif Info</legend>
-        <div id="exifInfo" class="info-lines"></div>
-      </fieldset>
-      <fieldset class="compact">
-        <legend>Actions</legend>
-        <div class="control-stack">
-          <div class="control-row">
-            <button id="fit">Fit</button>
-            <button id="revert">Revert</button>
-            <button id="save" class="primary">Save</button>
-            <button id="cancelSave" disabled>Cancel</button>
-          </div>
+      <canvas id="overlay"></canvas>
+      <div id="hudStack">
+        <div id="hud">Loading...</div>
+        <div id="saveStatusPanel">
           <div id="status"></div>
           <div id="saveActivity"></div>
         </div>
-      </fieldset>
+      </div>
+      <div id="scaleIndicator"><div class="scale-label"></div><div class="scale-bar"></div></div>
+      <div id="tooltip"></div>
+    </div>
+    <div id="controls">
+      <div class="tabs" role="tablist" aria-label="Control panels">
+        <button class="tab-button active" data-tab="image" type="button">Image Adjustment</button>
+        <button class="tab-button" data-tab="misc" type="button">Misc. Control</button>
+        <button class="tab-button" data-tab="save" type="button">Save</button>
+        <button class="tab-button" data-tab="exif" type="button">Exif Info</button>
+      </div>
+      <div class="tab-panel active" data-panel="image">
+        <fieldset class="compact">
+          <legend>Camera-Water Distance</legend>
+          <div class="control-stack">
+            <label>Altitude Correction [m]<input id="alt" type="text" inputmode="decimal"></label>
+            <div id="cameraWaterInfo" class="info-lines"></div>
+          </div>
+        </fieldset>
+        <fieldset class="compact">
+          <legend>Rotation Correction</legend>
+          <label>Degree<input id="yaw" type="text" inputmode="decimal"></label>
+        </fieldset>
+        <fieldset class="compact">
+          <legend>Transparency (%)</legend>
+          <label>Opacity <input id="opacity" type="range" min="0" max="100"><span id="opacityText"></span></label>
+        </fieldset>
+        <fieldset class="compact">
+          <legend>Keyboard Shortcuts</legend>
+          <div id="shortcutInfo" class="info-lines"></div>
+        </fieldset>
+        <fieldset class="compact">
+          <legend>Adjustment Controls</legend>
+          <div class="control-row">
+            <button id="fit">Fit to View</button>
+            <button id="revert">Reset Adjustments</button>
+          </div>
+        </fieldset>
+      </div>
+      <div class="tab-panel" data-panel="save">
+        <fieldset class="compact save-options">
+          <legend>Save Options</legend>
+          <label class="check"><input id="cropOptimize" type="checkbox">Crop Optimize</label>
+          <div class="info-lines">When checked, mosaic saving uses the center area of each image as much as possible. This helps reduce blur near the edges of photos.</div>
+        </fieldset>
+        <fieldset class="compact">
+          <legend>Actions</legend>
+          <div class="control-stack">
+            <div class="control-row">
+              <button id="save">Save</button>
+              <button id="cancelSave" disabled>Cancel</button>
+            </div>
+          </div>
+        </fieldset>
+      </div>
+      <div class="tab-panel" data-panel="misc">
+        <fieldset class="wide">
+          <legend>Background Map</legend>
+          <div class="control-stack">
+            <label class="check"><input id="showBasemap" type="checkbox">Show Background Map</label>
+            <div class="radio-stack">
+              <label class="check"><input type="radio" name="basemapProvider" value="osm" checked>OpenStreetMap (Map)</label>
+              <label class="check"><input type="radio" name="basemapProvider" value="gsi">日本国土地理院 (Photo)</label>
+            </div>
+          </div>
+        </fieldset>
+        <fieldset class="wide">
+          <legend>Capture Order</legend>
+          <label class="check"><input id="showCaptureOrder" type="checkbox">Show Capture Order</label>
+          <div class="info-lines">Shows blue center markers, arrows from earlier to later captures, and capture time labels.</div>
+        </fieldset>
+        <fieldset class="wide">
+          <legend>Image Rotation Rule</legend>
+          <div class="control-stack">
+            <select id="yawMode"><option value="both">Use Flight + Gimbal Yaw Degree</option><option value="flight_only">Use Flight Yaw Degree</option><option value="gimbal_only">Use Gimbal Yaw Degree</option></select>
+            <label class="check"><input id="yawInvert" type="checkbox">Reverse rotate</label>
+            <div id="yawDescription" class="info-lines"></div>
+          </div>
+        </fieldset>
+      </div>
+      <div class="tab-panel" data-panel="exif">
+        <fieldset class="exif-group exif-product">
+          <legend>Product/Lens</legend>
+          <div id="exifProductInfo" class="info-lines"></div>
+        </fieldset>
+        <fieldset class="exif-group">
+          <legend>Relative Altitude</legend>
+          <div id="relativeAltitudeInfo" class="info-lines"></div>
+        </fieldset>
+        <fieldset class="exif-group">
+          <legend>Pitch</legend>
+          <div id="exifPitchInfo" class="info-lines"></div>
+        </fieldset>
+        <fieldset class="exif-group">
+          <legend>Roll</legend>
+          <div id="exifRollInfo" class="info-lines"></div>
+        </fieldset>
+        <fieldset class="exif-group">
+          <legend>Yaw</legend>
+          <div id="exifYawInfo" class="info-lines"></div>
+        </fieldset>
+      </div>
     </div>
   </div>
   <div id="modalBackdrop">
@@ -2482,8 +2587,12 @@ WEBUI_HTML = """<!doctype html>
 
 
 WEBUI_JS = r"""(() => {
+  const basemapCanvas = document.getElementById('basemap');
   const canvas = document.getElementById('gl');
+  const overlayCanvas = document.getElementById('overlay');
   const hud = document.getElementById('hud');
+  const scaleIndicator = document.getElementById('scaleIndicator');
+  const saveStatusPanel = document.getElementById('saveStatusPanel');
   const tooltip = document.getElementById('tooltip');
   const statusEl = document.getElementById('status');
   const saveActivityEl = document.getElementById('saveActivity');
@@ -2494,6 +2603,9 @@ WEBUI_JS = r"""(() => {
   const opacityEl = document.getElementById('opacity');
   const opacityTextEl = document.getElementById('opacityText');
   const cropOptimizeEl = document.getElementById('cropOptimize');
+  const showCaptureOrderEl = document.getElementById('showCaptureOrder');
+  const showBasemapEl = document.getElementById('showBasemap');
+  const basemapProviderEls = Array.from(document.querySelectorAll('input[name="basemapProvider"]'));
   const saveBtn = document.getElementById('save');
   const cancelSaveBtn = document.getElementById('cancelSave');
   const modalBackdrop = document.getElementById('modalBackdrop');
@@ -2506,8 +2618,15 @@ WEBUI_JS = r"""(() => {
   const relativeAltitudeInfoEl = document.getElementById('relativeAltitudeInfo');
   const yawDescriptionEl = document.getElementById('yawDescription');
   const shortcutInfoEl = document.getElementById('shortcutInfo');
-  const exifInfoEl = document.getElementById('exifInfo');
-  const gl = canvas.getContext('webgl', { antialias: true, alpha: false });
+  const exifProductInfoEl = document.getElementById('exifProductInfo');
+  const exifPitchInfoEl = document.getElementById('exifPitchInfo');
+  const exifRollInfoEl = document.getElementById('exifRollInfo');
+  const exifYawInfoEl = document.getElementById('exifYawInfo');
+  const tabButtons = Array.from(document.querySelectorAll('.tab-button'));
+  const tabPanels = Array.from(document.querySelectorAll('.tab-panel'));
+  const basemapCtx = basemapCanvas.getContext('2d');
+  const overlayCtx = overlayCanvas.getContext('2d');
+  const gl = canvas.getContext('webgl', { antialias: true, alpha: true });
   if (!gl) {
     hud.textContent = 'WebGL is not available in this browser.';
     return;
@@ -2578,8 +2697,28 @@ WEBUI_JS = r"""(() => {
   let memoryPollInterval = 0;
   let memoryInfo = null;
   let shutdownSent = false;
+  let lastCommittedNumberText = "";
+  const tileCache = new Map();
 
-  function setStatus(text) { statusEl.textContent = text || ''; }
+  function refreshSaveStatusPanel() {
+    if (!saveStatusPanel || !statusEl || !saveActivityEl) return;
+    saveStatusPanel.classList.toggle('has-status', !!statusEl.textContent);
+    saveStatusPanel.classList.toggle('active', saveActivityEl.classList.contains('active'));
+  }
+  function setStatus(text) {
+    statusEl.textContent = text || '';
+    refreshSaveStatusPanel();
+  }
+  function basemapProvider() {
+    const selected = basemapProviderEls.find(el => el.checked);
+    return selected ? selected.value : 'osm';
+  }
+  function basemapEnabled() {
+    return !!(showBasemapEl && showBasemapEl.checked);
+  }
+  function captureOrderEnabled() {
+    return !!(showCaptureOrderEl && showCaptureOrderEl.checked);
+  }
   function notifyServerShutdown() {
     if (shutdownSent) return;
     shutdownSent = true;
@@ -2595,11 +2734,29 @@ WEBUI_JS = r"""(() => {
     saveBtn.disabled = !!active;
     cancelSaveBtn.disabled = !cancellable;
     saveActivityEl.classList.toggle('active', !!active);
+    refreshSaveStatusPanel();
     setMemoryPolling(active ? 1000 : 5000);
   }
   function setLines(el, lines) {
     if (!el) return;
     el.textContent = Array.isArray(lines) ? lines.join('\n') : String(lines || '');
+  }
+  function updateExifGroups(lines) {
+    const product = [];
+    const pitch = [];
+    const roll = [];
+    const yaw = [];
+    for (const line of Array.isArray(lines) ? lines : []) {
+      if (/^(Product Name|Unique Camera Model|FOV)\b/.test(line)) product.push(line);
+      else if (/Pitch\b/.test(line)) pitch.push(line);
+      else if (/Roll\b/.test(line)) roll.push(line);
+      else if (/Yaw\b/.test(line)) yaw.push(line);
+      else product.push(line);
+    }
+    setLines(exifProductInfoEl, product);
+    setLines(exifPitchInfoEl, pitch);
+    setLines(exifRollInfoEl, roll);
+    setLines(exifYawInfoEl, yaw);
   }
   function updateInfo() {
     if (!state || !state.info) return;
@@ -2607,7 +2764,7 @@ WEBUI_JS = r"""(() => {
     setLines(relativeAltitudeInfoEl, state.info.relative_altitude_lines);
     setLines(yawDescriptionEl, state.info.yaw_description_lines);
     setLines(shortcutInfoEl, state.info.shortcut_lines);
-    setLines(exifInfoEl, state.info.exif_lines);
+    updateExifGroups(state.info.exif_lines);
   }
   function photoById(id) {
     if (!state || !state.photos) return null;
@@ -2617,12 +2774,14 @@ WEBUI_JS = r"""(() => {
     return Number.isFinite(Number(value)) ? Number(value).toFixed(2) : 'N/A';
   }
   function tooltipText(photo) {
-    return `${photo.name}\n` +
-      `Relative Altitude [m]: ${fmtNum(photo.alt_m)}\n` +
-      `Flight Pitch [degree]: ${fmtNum(photo.flight_pitch_deg)}\n` +
-      `Gimbal Pitch [degree]: ${fmtNum(photo.gimbal_pitch_deg)}\n` +
-      `Flight Yaw Degree: ${fmtNum(photo.flight_yaw_deg)}\n` +
-      `Gimbal Yaw Degree: ${fmtNum(photo.gimbal_yaw_deg)}`;
+    return `File\n` +
+      `  ${photo.name}\n\n` +
+      `Exif\n` +
+      `  Relative Altitude [m] : ${fmtNum(photo.alt_m)}\n` +
+      `  Flight Pitch [degree] : ${fmtNum(photo.flight_pitch_deg)}\n` +
+      `  Gimbal Pitch [degree] : ${fmtNum(photo.gimbal_pitch_deg)}\n` +
+      `  Flight Yaw Degree     : ${fmtNum(photo.flight_yaw_deg)}\n` +
+      `  Gimbal Yaw Degree     : ${fmtNum(photo.gimbal_yaw_deg)}`;
   }
   function pointInTri(px, py, a, b, c) {
     const v0x = c[0] - a[0], v0y = c[1] - a[1];
@@ -2660,10 +2819,15 @@ WEBUI_JS = r"""(() => {
     tooltip.textContent = text;
     tooltip.style.display = 'block';
     const pad = 12;
-    const x = Math.min(window.innerWidth - tooltip.offsetWidth - pad, ev.clientX + pad);
-    const y = Math.min(window.innerHeight - tooltip.offsetHeight - pad, ev.clientY + pad);
-    tooltip.style.left = `${Math.max(pad, x)}px`;
-    tooltip.style.top = `${Math.max(pad, y)}px`;
+    const stageRect = canvas.getBoundingClientRect();
+    let x = ev.clientX + pad;
+    let y = ev.clientY + pad;
+    if (x + tooltip.offsetWidth + pad > stageRect.right) x = ev.clientX - tooltip.offsetWidth - pad;
+    if (y + tooltip.offsetHeight + pad > stageRect.bottom) y = ev.clientY - tooltip.offsetHeight - pad;
+    x = Math.max(stageRect.left + pad, Math.min(stageRect.right - tooltip.offsetWidth - pad, x));
+    y = Math.max(stageRect.top + pad, Math.min(stageRect.bottom - tooltip.offsetHeight - pad, y));
+    tooltip.style.left = `${x}px`;
+    tooltip.style.top = `${y}px`;
   }
   function chooseOpacitySaveMode(opacity) {
     return new Promise(resolve => {
@@ -2740,6 +2904,14 @@ WEBUI_JS = r"""(() => {
       canvas.width = w;
       canvas.height = h;
     }
+    if (basemapCanvas.width !== w || basemapCanvas.height !== h) {
+      basemapCanvas.width = w;
+      basemapCanvas.height = h;
+    }
+    if (overlayCanvas.width !== w || overlayCanvas.height !== h) {
+      overlayCanvas.width = w;
+      overlayCanvas.height = h;
+    }
     gl.viewport(0, 0, canvas.width, canvas.height);
     draw();
   }
@@ -2813,9 +2985,237 @@ WEBUI_JS = r"""(() => {
     layers = next;
     return true;
   }
+  function previewToScreen(pt) {
+    return [(pt[0] - pan[0]) * zoom, (pt[1] - pan[1]) * zoom];
+  }
+  function latLonToPreview(lat, lon) {
+    const g = state && state.georef ? state.georef : null;
+    const full = state && state.full_canvas ? state.full_canvas : null;
+    const scale = state && state.canvas ? Number(state.canvas.scale || 1) : 1;
+    if (!g || !full) return [0, 0];
+    const x = (Number(lon) - Number(g.origin_lon)) * Number(g.m_per_deg_lon);
+    const y = (Number(lat) - Number(g.origin_lat)) * Number(g.m_per_deg_lat);
+    const u = (x - Number(g.min_x)) / Number(full.mpp) * scale;
+    const v = (Number(g.max_y) - y) / Number(full.mpp) * scale;
+    return [u, v];
+  }
+  function previewToLatLon(u, v) {
+    const g = state && state.georef ? state.georef : null;
+    const full = state && state.full_canvas ? state.full_canvas : null;
+    const scale = state && state.canvas ? Number(state.canvas.scale || 1) : 1;
+    if (!g || !full) return [0, 0];
+    const x = Number(g.min_x) + (Number(u) / scale) * Number(full.mpp);
+    const y = Number(g.max_y) - (Number(v) / scale) * Number(full.mpp);
+    const lat = Number(g.origin_lat) + y / Number(g.m_per_deg_lat);
+    const lon = Number(g.origin_lon) + x / Number(g.m_per_deg_lon);
+    return [lat, lon];
+  }
+  function lonToTileX(lon, z) {
+    return Math.floor(((Number(lon) + 180) / 360) * Math.pow(2, z));
+  }
+  function latToTileY(lat, z) {
+    const rad = Number(lat) * Math.PI / 180;
+    return Math.floor((1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2 * Math.pow(2, z));
+  }
+  function tileXToLon(x, z) {
+    return x / Math.pow(2, z) * 360 - 180;
+  }
+  function tileYToLat(y, z) {
+    const n = Math.PI - 2 * Math.PI * y / Math.pow(2, z);
+    return 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+  }
+  function chooseTileZoom(provider) {
+    const full = state && state.full_canvas ? state.full_canvas : null;
+    const scale = state && state.canvas ? Number(state.canvas.scale || 1) : 1;
+    const g = state && state.georef ? state.georef : null;
+    if (!full || !g) return provider === 'gsi' ? 16 : 17;
+    const metersPerScreenPx = (Number(full.mpp) / scale) / Math.max(zoom, 0.0001);
+    const lat = Number(g.origin_lat);
+    const earth = 40075016.686;
+    const raw = Math.log2(Math.cos(lat * Math.PI / 180) * earth / (256 * Math.max(metersPerScreenPx, 0.01)));
+    const maxZ = provider === 'gsi' ? 18 : 19;
+    return Math.max(1, Math.min(maxZ, Math.floor(raw)));
+  }
+  function loadTile(provider, z, x, y) {
+    const max = Math.pow(2, z);
+    if (x < 0 || y < 0 || x >= max || y >= max) return null;
+    const key = `${provider}/${z}/${x}/${y}`;
+    let item = tileCache.get(key);
+    if (item) return item;
+    const img = new Image();
+    item = { img, loaded: false, failed: false };
+    img.onload = () => { item.loaded = true; draw(); };
+    img.onerror = () => { item.failed = true; };
+    img.src = `/tile/${provider}/${z}/${x}/${y}`;
+    tileCache.set(key, item);
+    return item;
+  }
+  function visibleBasemapTiles() {
+    const result = [];
+    if (!state || !basemapEnabled()) return result;
+    const provider = basemapProvider();
+    let z = chooseTileZoom(provider);
+    const visible = [
+      previewToLatLon(pan[0], pan[1]),
+      previewToLatLon(pan[0] + canvas.width / Math.max(zoom, 0.0001), pan[1] + canvas.height / Math.max(zoom, 0.0001)),
+    ];
+    const minLat = Math.max(-85.0511, Math.min(visible[0][0], visible[1][0]));
+    const maxLat = Math.min(85.0511, Math.max(visible[0][0], visible[1][0]));
+    const minLon = Math.max(-180, Math.min(visible[0][1], visible[1][1]));
+    const maxLon = Math.min(180, Math.max(visible[0][1], visible[1][1]));
+    let x0 = lonToTileX(minLon, z);
+    let x1 = lonToTileX(maxLon, z);
+    let y0 = latToTileY(maxLat, z);
+    let y1 = latToTileY(minLat, z);
+    while ((x1 - x0 + 1) * (y1 - y0 + 1) > 180 && z > 1) {
+      z -= 1;
+      x0 = lonToTileX(minLon, z);
+      x1 = lonToTileX(maxLon, z);
+      y0 = latToTileY(maxLat, z);
+      y1 = latToTileY(minLat, z);
+    }
+    for (let ty = y0; ty <= y1; ty += 1) {
+      for (let tx = x0; tx <= x1; tx += 1) {
+        const tile = loadTile(provider, z, tx, ty);
+        if (!tile || !tile.loaded) continue;
+        const nw = latLonToPreview(tileYToLat(ty, z), tileXToLon(tx, z));
+        const se = latLonToPreview(tileYToLat(ty + 1, z), tileXToLon(tx + 1, z));
+        result.push({ tile, corners: [[nw[0], nw[1]], [se[0], nw[1]], [se[0], se[1]], [nw[0], se[1]]] });
+      }
+    }
+    return result;
+  }
+  function drawBasemapGl() {
+    if (!state || !basemapEnabled()) return;
+    gl.uniform1f(loc.opacity, 1);
+    for (const entry of visibleBasemapTiles()) {
+      if (!entry.tile.texture) entry.tile.texture = makeTexture(entry.tile.img);
+      gl.bindTexture(gl.TEXTURE_2D, entry.tile.texture);
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, posData(entry.corners), gl.STATIC_DRAW);
+      gl.vertexAttribPointer(loc.pos, 2, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+  }
+  function drawMapAttribution(ctx) {
+    if (!basemapEnabled()) return;
+    const provider = basemapProvider();
+    const text = provider === 'gsi' ? 'Source: 国土地理院 地理院タイル' : '© OpenStreetMap contributors';
+    ctx.save();
+    ctx.font = '12px system-ui, -apple-system, Segoe UI, sans-serif';
+    const pad = 6;
+    const w = ctx.measureText(text).width + pad * 2;
+    const h = 22;
+    const x = overlayCanvas.width - w - 8;
+    const y = overlayCanvas.height - h - 8;
+    ctx.fillStyle = 'rgba(255,255,255,.86)';
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = '#202124';
+    ctx.fillText(text, x + pad, y + 15);
+    ctx.restore();
+  }
+  function drawArrow(ctx, from, to) {
+    const dx = to[0] - from[0];
+    const dy = to[1] - from[1];
+    const len = Math.hypot(dx, dy);
+    if (len < 1) return;
+    const ux = dx / len;
+    const uy = dy / len;
+    const start = [from[0] + ux * 11, from[1] + uy * 11];
+    const end = [to[0] - ux * 13, to[1] - uy * 13];
+    ctx.beginPath();
+    ctx.moveTo(start[0], start[1]);
+    ctx.lineTo(end[0], end[1]);
+    ctx.stroke();
+    const size = 12;
+    ctx.beginPath();
+    ctx.moveTo(end[0], end[1]);
+    ctx.lineTo(end[0] - ux * size - uy * size * 0.55, end[1] - uy * size + ux * size * 0.55);
+    ctx.lineTo(end[0] - ux * size + uy * size * 0.55, end[1] - uy * size - ux * size * 0.55);
+    ctx.closePath();
+    ctx.fill();
+  }
+  function drawSequenceOverlay() {
+    if (!overlayCtx) return;
+    overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    drawMapAttribution(overlayCtx);
+    if (!state || !captureOrderEnabled()) return;
+    const seq = Array.isArray(state.sequence) ? state.sequence : [];
+    const pts = seq.map(item => ({ ...item, screen: previewToScreen([item.center[0], item.center[1]]) }));
+    overlayCtx.save();
+    overlayCtx.lineWidth = 5;
+    overlayCtx.lineCap = 'round';
+    overlayCtx.lineJoin = 'round';
+    overlayCtx.strokeStyle = '#1a73e8';
+    overlayCtx.fillStyle = '#1a73e8';
+    for (let i = 0; i < pts.length - 1; i += 1) drawArrow(overlayCtx, pts[i].screen, pts[i + 1].screen);
+    overlayCtx.font = '12px system-ui, -apple-system, Segoe UI, sans-serif';
+    overlayCtx.textAlign = 'center';
+    overlayCtx.textBaseline = 'top';
+    for (const p of pts) {
+      overlayCtx.beginPath();
+      overlayCtx.arc(p.screen[0], p.screen[1], 6, 0, Math.PI * 2);
+      overlayCtx.fillStyle = '#1a73e8';
+      overlayCtx.fill();
+      const label = p.captured_at || p.name || '';
+      if (label) {
+        const textY = p.screen[1] + 10;
+        const metrics = overlayCtx.measureText(label);
+        overlayCtx.fillStyle = 'rgba(255,255,255,.84)';
+        overlayCtx.fillRect(p.screen[0] - metrics.width / 2 - 4, textY - 1, metrics.width + 8, 16);
+        overlayCtx.fillStyle = '#174ea6';
+        overlayCtx.fillText(label, p.screen[0], textY);
+      }
+    }
+    overlayCtx.restore();
+  }
+  function photoLayerOpacity() {
+    return Math.max(0, Math.min(1, (Number(state.options.opacity_pct) || 100) / 100));
+  }
+  function niceScaleMeters(rawMeters) {
+    if (!Number.isFinite(rawMeters) || rawMeters <= 0) return 0;
+    const exp = Math.floor(Math.log10(rawMeters));
+    const base = rawMeters / Math.pow(10, exp);
+    const niceBase = base >= 5 ? 5 : base >= 2 ? 2 : 1;
+    return niceBase * Math.pow(10, exp);
+  }
+  function formatScaleMeters(meters) {
+    if (meters >= 1000) {
+      const km = meters / 1000;
+      return `${Number.isInteger(km) ? km.toFixed(0) : km.toFixed(1)} km`;
+    }
+    return `${Math.round(meters)} m`;
+  }
+  function updateScaleIndicator() {
+    if (!scaleIndicator || !state || !state.full_canvas || !state.canvas) return;
+    const full = state.full_canvas;
+    const scale = Number(state.canvas.scale || 1);
+    const mpp = Number(full.mpp);
+    const dpr = canvas.width / Math.max(1, canvas.clientWidth || canvas.width);
+    if (!Number.isFinite(mpp) || !Number.isFinite(scale) || scale <= 0 || zoom <= 0) {
+      scaleIndicator.style.display = 'none';
+      return;
+    }
+    const metersPerCssPx = (mpp / scale) * dpr / Math.max(zoom, 0.0001);
+    const meters = niceScaleMeters(metersPerCssPx * 480);
+    const widthPx = Math.max(120, Math.min(720, meters / metersPerCssPx));
+    if (!meters || !Number.isFinite(widthPx)) {
+      scaleIndicator.style.display = 'none';
+      return;
+    }
+    scaleIndicator.querySelector('.scale-label').textContent = formatScaleMeters(meters);
+    scaleIndicator.querySelector('.scale-bar').style.width = `${widthPx.toFixed(0)}px`;
+    scaleIndicator.style.display = 'block';
+  }
   function draw() {
     if (!state) return;
-    gl.clearColor(1, 1, 1, 1);
+    const photoOpacity = photoLayerOpacity();
+    if (basemapCtx) basemapCtx.clearRect(0, 0, basemapCanvas.width, basemapCanvas.height);
+    if (basemapEnabled() || photoOpacity >= 0.999) {
+      gl.clearColor(1, 1, 1, 1);
+    } else {
+      gl.clearColor(0.5, 0.5, 0.5, 1);
+    }
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -2824,12 +3224,14 @@ WEBUI_JS = r"""(() => {
     gl.uniform2f(loc.view, canvas.width, canvas.height);
     gl.uniform1f(loc.zoom, zoom);
     gl.uniform2f(loc.pan, pan[0], pan[1]);
-    gl.uniform1f(loc.opacity, (state.options.opacity_pct || 100) / 100);
+    gl.uniform1f(loc.opacity, photoOpacity);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
     gl.enableVertexAttribArray(loc.uv);
     gl.vertexAttribPointer(loc.uv, 2, gl.FLOAT, false, 0, 0);
     gl.enableVertexAttribArray(loc.pos);
+    drawBasemapGl();
+    gl.uniform1f(loc.opacity, photoOpacity);
     for (const layer of layers) {
       gl.bindTexture(gl.TEXTURE_2D, layer.texture);
       gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
@@ -2852,6 +3254,8 @@ WEBUI_JS = r"""(() => {
       `<div class="hud-lines">${escapeHtml(lines)}</div>` +
       `<div class="mem-row">physical memory${memLabel} ${escapeHtml(memTotal)}<br>available memory${memLabel} ${escapeHtml(memAvailable)}</div>` +
       `<div class="mem-bar"><div class="mem-fill" style="width:${memPct.toFixed(1)}%"></div></div>`;
+    updateScaleIndicator();
+    drawSequenceOverlay();
   }
   async function updateMemoryInfo() {
     try {
@@ -2869,14 +3273,20 @@ WEBUI_JS = r"""(() => {
     memoryPollInterval = intervalMs;
     memoryPollTimer = setInterval(updateMemoryInfo, intervalMs);
   }
+  function isFocused(el) {
+    return document.activeElement === el;
+  }
   function syncControlsFromState() {
-    altEl.value = state.options.alt_correction_m;
-    yawEl.value = state.options.yaw_offset_deg;
+    if (!isFocused(altEl)) altEl.value = state.options.alt_correction_m;
+    if (!isFocused(yawEl)) yawEl.value = state.options.yaw_offset_deg;
     yawModeEl.value = state.options.yaw_mode;
     yawInvertEl.checked = !!state.options.yaw_invert;
     opacityEl.value = state.options.opacity_pct;
     opacityTextEl.textContent = `${Math.round(state.options.opacity_pct)}%`;
     cropOptimizeEl.checked = !!state.options.crop_optimize;
+    if (!isFocused(altEl) && !isFocused(yawEl)) {
+      lastCommittedNumberText = `${altEl.value}|${yawEl.value}`;
+    }
     updateInfo();
   }
   async function loadState(refit = false) {
@@ -2921,8 +3331,36 @@ WEBUI_JS = r"""(() => {
   function setNumericValue(el, value) {
     el.value = Number(value).toFixed(2);
   }
+  function commitNumberEdits() {
+    const alt = parseFloat(altEl.value);
+    const yaw = parseFloat(yawEl.value);
+    if (!Number.isFinite(alt)) altEl.value = state ? state.options.alt_correction_m : '0';
+    if (!Number.isFinite(yaw)) yawEl.value = state ? state.options.yaw_offset_deg : '0';
+    const currentText = `${altEl.value}|${yawEl.value}`;
+    if (currentText === lastCommittedNumberText) return Promise.resolve();
+    lastCommittedNumberText = currentText;
+    return updateOptions(false);
+  }
+  function onNumberEditKeydown(ev) {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      commitNumberEdits();
+      focusStage();
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      if (state) {
+        ev.currentTarget.value = ev.currentTarget === altEl ? state.options.alt_correction_m : state.options.yaw_offset_deg;
+      }
+      focusStage();
+    }
+  }
   function focusStage() {
     canvas.focus({ preventScroll: true });
+  }
+  function showTab(name) {
+    tabButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.tab === name));
+    tabPanels.forEach(panel => panel.classList.toggle('active', panel.dataset.panel === name));
+    resize();
   }
   function isTypingTarget(target) {
     if (!target) return false;
@@ -2946,7 +3384,11 @@ WEBUI_JS = r"""(() => {
     ev.preventDefault();
     scheduleOptions(false);
   });
-  [altEl, yawEl, yawModeEl, yawInvertEl, cropOptimizeEl].forEach(el => el.addEventListener('input', () => scheduleOptions(false)));
+  [altEl, yawEl].forEach(el => {
+    el.addEventListener('change', commitNumberEdits);
+    el.addEventListener('keydown', onNumberEditKeydown);
+  });
+  [yawModeEl, yawInvertEl, cropOptimizeEl].forEach(el => el.addEventListener('input', () => scheduleOptions(false)));
   opacityEl.addEventListener('input', () => {
     opacityTextEl.textContent = `${opacityEl.value}%`;
     if (state) state.options.opacity_pct = parseFloat(opacityEl.value || '100');
@@ -2958,6 +3400,10 @@ WEBUI_JS = r"""(() => {
   yawModeEl.addEventListener('change', focusStage);
   yawInvertEl.addEventListener('change', focusStage);
   cropOptimizeEl.addEventListener('change', focusStage);
+  showCaptureOrderEl.addEventListener('change', draw);
+  showBasemapEl.addEventListener('change', draw);
+  basemapProviderEls.forEach(el => el.addEventListener('change', draw));
+  tabButtons.forEach(btn => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
   document.getElementById('fit').addEventListener('click', fit);
   document.getElementById('revert').addEventListener('click', async () => {
     setStatus('Reverting...');
@@ -3389,7 +3835,9 @@ class WebMosaicSession:
             _estimate_photo_peak_bytes(meta, canvas_w, canvas_h, mpp, self.options) for meta in self.metas
         )
         estimated_memory = canvas_memory + peak_photo_memory
+        m_per_deg_lat, m_per_deg_lon = _meters_per_deg(origin_lat)
         photos: List[Dict[str, object]] = []
+        sequence: List[Dict[str, object]] = []
         ordered = sorted(enumerate(self.metas), key=lambda item: _effective_alt_m(item[1], self.options), reverse=True)
         for idx, meta in ordered:
             corners_world = _project_corners(meta, origin_lat, origin_lon, self.options)
@@ -3417,6 +3865,29 @@ class WebMosaicSession:
                     "gimbal_yaw_deg": meta.gimbal_yaw_deg,
                 }
             )
+        ordered_sequence = sorted(
+            enumerate(self.metas),
+            key=lambda item: ((getattr(item[1], "captured_at", None) or ""), os.path.basename(item[1].path), item[0]),
+        )
+        for order, (idx, meta) in enumerate(ordered_sequence, start=1):
+            corners_world = _project_corners(meta, origin_lat, origin_lon, self.options)
+            center_world = np.mean(corners_world, axis=0)
+            center_u, center_v = _world_to_canvas(
+                np.array([center_world[0]], dtype=np.float64),
+                np.array([center_world[1]], dtype=np.float64),
+                min_x=min_x,
+                max_y=max_y,
+                mpp=mpp,
+            )
+            sequence.append(
+                {
+                    "id": idx,
+                    "order": order,
+                    "name": os.path.basename(meta.path),
+                    "captured_at": getattr(meta, "captured_at", None) or os.path.basename(meta.path),
+                    "center": [float(center_u[0]) * scale, float(center_v[0]) * scale],
+                }
+            )
         return {
             "canvas": {"width": canvas_w * scale, "height": canvas_h * scale, "scale": scale},
             "full_canvas": {
@@ -3426,6 +3897,14 @@ class WebMosaicSession:
                 "estimated_memory_bytes": estimated_memory,
                 "estimated_memory": _format_bytes_hr(estimated_memory),
                 "memory_safety_margin_bytes": MEMORY_SAFETY_MARGIN_BYTES,
+            },
+            "georef": {
+                "origin_lat": origin_lat,
+                "origin_lon": origin_lon,
+                "min_x": min_x,
+                "max_y": max_y,
+                "m_per_deg_lat": m_per_deg_lat,
+                "m_per_deg_lon": m_per_deg_lon,
             },
             "options": {
                 "alt_correction_m": self.options.alt_correction_m,
@@ -3438,6 +3917,7 @@ class WebMosaicSession:
             },
             "info": _build_ui_info(self.metas, self.options),
             "photos": photos,
+            "sequence": sequence,
             "warnings": ["WebUI preview does not apply undistortion yet."] if self.options.undistort else [],
         }
 
@@ -3582,6 +4062,29 @@ def _make_webui_handler(session: WebMosaicSession, debug: bool = False):
             self.end_headers()
             self.wfile.write(data)
 
+        def _tile(self, provider: str, z: int, x: int, y: int) -> Tuple[bytes, str]:
+            if provider == "osm":
+                max_z = 19
+                url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+                mime = "image/png"
+            elif provider == "gsi":
+                max_z = 18
+                url = f"https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg"
+                mime = "image/jpeg"
+            else:
+                raise FileNotFoundError("unknown tile provider")
+            if z < 0 or z > max_z or x < 0 or y < 0 or x >= 2**z or y >= 2**z:
+                raise FileNotFoundError("tile out of range")
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": "bvpp-webui/0.1 (+local preview)",
+                    "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*",
+                },
+            )
+            with urlopen(req, timeout=10) as resp:
+                return resp.read(), mime
+
         def _json(self, payload: Dict[str, object], status: int = 200) -> None:
             self._send(status, json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8")
 
@@ -3602,6 +4105,14 @@ def _make_webui_handler(session: WebMosaicSession, debug: bool = False):
                 return
             if parsed.path == "/api/memory":
                 self._json(session.memory_status())
+                return
+            if parsed.path.startswith("/tile/"):
+                try:
+                    _, _, provider, zs, xs, ys = parsed.path.split("/", 5)
+                    data, mime = self._tile(provider, int(zs), int(xs), int(ys))
+                    self._send(200, data, mime)
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 404)
                 return
             if parsed.path.startswith("/image/"):
                 try:
@@ -4081,8 +4592,15 @@ class MosaicGUI(QtWidgets.QMainWindow):
                 yaw_deg=meta.yaw_deg,
                 hfov_deg=meta.hfov_deg,
                 pitch_deg=meta.pitch_deg,
+                flight_yaw_deg=meta.flight_yaw_deg,
+                gimbal_yaw_deg=meta.gimbal_yaw_deg,
                 flight_pitch_deg=meta.flight_pitch_deg,
                 gimbal_pitch_deg=meta.gimbal_pitch_deg,
+                gimbal_roll_deg=meta.gimbal_roll_deg,
+                flight_roll_deg=meta.flight_roll_deg,
+                product_name=meta.product_name,
+                unique_camera_model=meta.unique_camera_model,
+                captured_at=meta.captured_at,
             )
 
             warped, offset = _warp_photo_to_canvas_from_rgba(
