@@ -2405,9 +2405,25 @@ WEBUI_HTML = """<!doctype html>
     #hud { min-width: 250px; padding: 8px 10px; border-radius: 6px; background: rgba(255,255,255,.88); box-shadow: 0 1px 6px rgba(0,0,0,.16); font-size: 12px; line-height: 1.35; }
     #saveStatusPanel { display: none; min-width: 250px; max-width: 360px; padding: 7px 10px; border-radius: 6px; background: rgba(255,255,255,.9); box-shadow: 0 1px 6px rgba(0,0,0,.16); }
     #saveStatusPanel.active, #saveStatusPanel.has-status { display: block; }
-    #scaleIndicator { position: absolute; left: 12px; bottom: 10px; display: none; min-width: 72px; padding: 5px 7px 6px; border-radius: 5px; background: rgba(255,255,255,.86); box-shadow: 0 1px 5px rgba(0,0,0,.16); color: #202124; font-size: 12px; line-height: 1; pointer-events: none; }
-    #scaleIndicator .scale-label { margin-bottom: 4px; text-align: center; font-weight: 600; }
-    #scaleIndicator .scale-bar { height: 6px; border: solid #202124; border-width: 0 2px 2px; box-sizing: border-box; }
+    #scaleIndicator { --scale-len: 120px; position: absolute; left: 12px; bottom: 10px; display: none; min-width: 72px; color: #202124; font-size: 12px; line-height: 1; pointer-events: none; }
+    #scaleIndicator::before { content: ""; position: absolute; left: 0; bottom: 0; z-index: 0; width: calc(var(--scale-len) + 47px); height: calc(var(--scale-len) + 25px); border-radius: 5px; background: rgba(255,255,255,.86); box-shadow: 0 1px 5px rgba(0,0,0,.16); clip-path: polygon(0 0, 42px 0, 42px calc(100% - 19px), 100% calc(100% - 19px), 100% 100%, 0 100%); }
+    .scale-indicator .scale-label, .scale-indicator .scale-bar, .scale-indicator .scale-v-label, .scale-indicator .scale-v-bar { z-index: 1; }
+    .scale-indicator .scale-label { position: absolute; left: 40px; bottom: 0; height: 12px; font-weight: 600; white-space: nowrap; }
+    .scale-indicator .scale-label span { position: absolute; top: 0; }
+    .scale-indicator .scale-label .scale-label-mid { left: 50%; transform: translateX(-50%); }
+    .scale-indicator .scale-label .scale-label-end { right: 0; }
+    .scale-indicator .scale-bar { position: absolute; left: 40px; bottom: 9px; height: 10px; border: solid #202124; border-width: 2px 2px 0; box-sizing: border-box; }
+    .scale-indicator .scale-v-label { position: absolute; left: 5px; bottom: 17px; width: 24px; font-weight: 600; white-space: nowrap; }
+    .scale-indicator .scale-v-label span { position: absolute; left: 0; }
+    .scale-indicator .scale-v-label .scale-label-mid { bottom: 50%; transform: translateY(50%); }
+    .scale-indicator .scale-v-label .scale-label-end { top: 0; }
+    .scale-indicator .scale-v-bar { position: absolute; left: 32px; bottom: 17px; width: 10px; border: solid #202124; border-width: 2px 2px 2px 0; box-sizing: border-box; }
+    .scale-indicator .scale-tick { position: absolute; top: 0; width: 1px; height: 4px; background: rgba(32,33,36,.62); transform: translateX(-.5px); }
+    .scale-indicator .scale-tick.major { height: 7px; background: rgba(32,33,36,.82); }
+    .scale-indicator .scale-tick.strong { width: 2px; height: 10px; background: #202124; transform: translateX(-1px); }
+    .scale-indicator .scale-v-bar .scale-tick { left: auto; right: 0; top: auto; width: 4px; height: 1px; transform: translateY(.5px); }
+    .scale-indicator .scale-v-bar .scale-tick.major { width: 7px; height: 1px; }
+    .scale-indicator .scale-v-bar .scale-tick.strong { width: 10px; height: 2px; transform: translateY(1px); }
     .hud-lines { white-space: pre-line; }
     .mem-row { margin-top: 6px; }
     .mem-bar { width: 100%; height: 8px; margin-top: 3px; overflow: hidden; border-radius: 999px; background: #dfe3e8; }
@@ -2466,7 +2482,7 @@ WEBUI_HTML = """<!doctype html>
           <div id="saveActivity"></div>
         </div>
       </div>
-      <div id="scaleIndicator"><div class="scale-label"></div><div class="scale-bar"></div></div>
+      <div id="scaleIndicator" class="scale-indicator"><div class="scale-v-label"></div><div class="scale-v-bar"></div><div class="scale-label"></div><div class="scale-bar"></div></div>
       <div id="tooltip"></div>
     </div>
     <div id="controls">
@@ -2493,12 +2509,20 @@ WEBUI_HTML = """<!doctype html>
           <label>Opacity <input id="opacity" type="range" min="0" max="100"><span id="opacityText"></span></label>
         </fieldset>
         <fieldset class="compact">
+          <legend>Overlap Effect</legend>
+          <div class="radio-stack">
+            <label class="check"><input type="radio" name="compareMode" value="normal" checked>None</label>
+            <label class="check"><input type="radio" name="compareMode" value="pair-swipe">Swipe</label>
+            <label class="check"><input type="radio" name="compareMode" value="focus">Focus Hover</label>
+          </div>
+        </fieldset>
+        <fieldset class="compact">
           <legend>Keyboard Shortcuts</legend>
           <div id="shortcutInfo" class="info-lines"></div>
         </fieldset>
         <fieldset class="compact">
           <legend>Adjustment Controls</legend>
-          <div class="control-row">
+          <div class="control-stack">
             <button id="fit">Fit to View</button>
             <button id="revert">Reset Adjustments</button>
           </div>
@@ -2602,6 +2626,7 @@ WEBUI_JS = r"""(() => {
   const yawInvertEl = document.getElementById('yawInvert');
   const opacityEl = document.getElementById('opacity');
   const opacityTextEl = document.getElementById('opacityText');
+  const compareModeEls = Array.from(document.querySelectorAll('input[name="compareMode"]'));
   const cropOptimizeEl = document.getElementById('cropOptimize');
   const showCaptureOrderEl = document.getElementById('showCaptureOrder');
   const showBasemapEl = document.getElementById('showBasemap');
@@ -2651,7 +2676,14 @@ WEBUI_JS = r"""(() => {
     varying vec2 v_uv;
     uniform sampler2D u_tex;
     uniform float u_opacity;
+    uniform int u_compare_mode;
+    uniform float u_layer_parity;
+    uniform float u_swipe_x;
     void main() {
+      if (u_compare_mode == 1) {
+        bool showLeft = gl_FragCoord.x <= u_swipe_x;
+        if ((u_layer_parity < 0.5 && !showLeft) || (u_layer_parity > 0.5 && showLeft)) discard;
+      }
       vec4 c = texture2D(u_tex, v_uv);
       gl_FragColor = vec4(c.rgb, c.a * u_opacity);
     }`;
@@ -2678,6 +2710,9 @@ WEBUI_JS = r"""(() => {
     zoom: gl.getUniformLocation(program, 'u_zoom'),
     pan: gl.getUniformLocation(program, 'u_pan'),
     opacity: gl.getUniformLocation(program, 'u_opacity'),
+    compareMode: gl.getUniformLocation(program, 'u_compare_mode'),
+    layerParity: gl.getUniformLocation(program, 'u_layer_parity'),
+    swipeX: gl.getUniformLocation(program, 'u_swipe_x'),
   };
   const posBuf = gl.createBuffer();
   const uvBuf = gl.createBuffer();
@@ -2696,6 +2731,9 @@ WEBUI_JS = r"""(() => {
   let memoryPollTimer = null;
   let memoryPollInterval = 0;
   let memoryInfo = null;
+  let hoverPhotoId = null;
+  let hoverUnderPhotoId = null;
+  let hoverScreenX = 0;
   let shutdownSent = false;
   let lastCommittedNumberText = "";
   const tileCache = new Map();
@@ -3088,6 +3126,9 @@ WEBUI_JS = r"""(() => {
   function drawBasemapGl() {
     if (!state || !basemapEnabled()) return;
     gl.uniform1f(loc.opacity, 1);
+    gl.uniform1i(loc.compareMode, 0);
+    gl.uniform1f(loc.layerParity, 0);
+    gl.uniform1f(loc.swipeX, 0);
     for (const entry of visibleBasemapTiles()) {
       if (!entry.tile.texture) entry.tile.texture = makeTexture(entry.tile.img);
       gl.bindTexture(gl.TEXTURE_2D, entry.tile.texture);
@@ -3112,6 +3153,58 @@ WEBUI_JS = r"""(() => {
     ctx.fillRect(x, y, w, h);
     ctx.fillStyle = '#202124';
     ctx.fillText(text, x + pad, y + 15);
+    ctx.restore();
+  }
+  function compareMode() {
+    const checked = compareModeEls.find(el => el.checked);
+    return checked ? checked.value : 'normal';
+  }
+  function pairModeActive(mode) {
+    return mode === 'pair-swipe';
+  }
+  function layerById(id) {
+    return id == null ? null : layers.find(layer => layer.id === id) || null;
+  }
+  function drawPhotoLayer(layer, opacity, shaderMode = 0, parity = 0) {
+    gl.uniform1f(loc.opacity, opacity);
+    gl.uniform1i(loc.compareMode, shaderMode);
+    gl.uniform1f(loc.layerParity, parity);
+    gl.bindTexture(gl.TEXTURE_2D, layer.texture);
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, layer.pos, gl.STATIC_DRAW);
+    gl.vertexAttribPointer(loc.pos, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+  function drawLayerOutlines(ctx) {
+    const mode = compareMode();
+    if ((mode !== 'focus' && mode !== 'pair-swipe') || !layers.length) return;
+    ctx.save();
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.setLineDash([]);
+    for (let i = 0; i < layers.length; i += 1) {
+      if (mode === 'focus' && layers[i].id !== hoverPhotoId) continue;
+      if (pairModeActive(mode) && layers[i].id !== hoverPhotoId && layers[i].id !== hoverUnderPhotoId) continue;
+      const p = layers[i].pos;
+      if (!p || p.length < 12) continue;
+      const corners = [
+        previewToScreen([p[0], p[1]]),
+        previewToScreen([p[2], p[3]]),
+        previewToScreen([p[4], p[5]]),
+        previewToScreen([p[10], p[11]]),
+      ];
+      const color = i % 2 ? '#e8710a' : '#1a73e8';
+      ctx.beginPath();
+      ctx.moveTo(corners[0][0], corners[0][1]);
+      for (let j = 1; j < corners.length; j += 1) ctx.lineTo(corners[j][0], corners[j][1]);
+      ctx.closePath();
+      ctx.strokeStyle = 'rgba(255,255,255,.92)';
+      ctx.lineWidth = 5;
+      ctx.stroke();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
     ctx.restore();
   }
   function drawArrow(ctx, from, to) {
@@ -3139,6 +3232,7 @@ WEBUI_JS = r"""(() => {
     if (!overlayCtx) return;
     overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
     drawMapAttribution(overlayCtx);
+    drawLayerOutlines(overlayCtx);
     if (!state || !captureOrderEnabled()) return;
     const seq = Array.isArray(state.sequence) ? state.sequence : [];
     const pts = seq.map(item => ({ ...item, screen: previewToScreen([item.center[0], item.center[1]]) }));
@@ -3184,7 +3278,89 @@ WEBUI_JS = r"""(() => {
       const km = meters / 1000;
       return `${Number.isInteger(km) ? km.toFixed(0) : km.toFixed(1)} km`;
     }
+    if (meters < 1) {
+      const cm = meters * 100;
+      return `${Number.isInteger(cm) ? cm.toFixed(0) : cm.toFixed(1)} cm`;
+    }
+    if (!Number.isInteger(meters)) {
+      return `${meters.toFixed(1).replace(/\.0$/, '')} m`;
+    }
     return `${Math.round(meters)} m`;
+  }
+  function isNearMultiple(value, interval) {
+    if (!Number.isFinite(value) || !Number.isFinite(interval) || interval <= 0) return false;
+    return Math.abs(value / interval - Math.round(value / interval)) < 1e-6;
+  }
+  function scaleTickIntervals(meters) {
+    const exp = Math.floor(Math.log10(meters));
+    const pow = Math.pow(10, exp);
+    const base = Math.round((meters / pow) * 10) / 10;
+    const major = Math.pow(10, base === 1 ? exp - 1 : exp);
+    const strong = base === 1 ? meters / 2 : 0;
+    return { major, strong };
+  }
+  function renderScaleTicks(scaleBar, meters, vertical = false) {
+    if (!scaleBar || !Number.isFinite(meters) || meters <= 0) return;
+    const tickStep = meters / 20;
+    const intervals = scaleTickIntervals(meters);
+    const frag = document.createDocumentFragment();
+    for (let i = 1; i < 20; i++) {
+      const tickValue = tickStep * i;
+      const tick = document.createElement('span');
+      tick.className = 'scale-tick';
+      if (intervals.strong && isNearMultiple(tickValue, intervals.strong)) {
+        tick.classList.add('strong');
+      } else if (isNearMultiple(tickValue, intervals.major)) {
+        tick.classList.add('major');
+      }
+      if (vertical) {
+        tick.style.bottom = `${(i / 20) * 100}%`;
+      } else {
+        tick.style.left = `${(i / 20) * 100}%`;
+      }
+      frag.appendChild(tick);
+    }
+    scaleBar.replaceChildren(frag);
+  }
+  function renderScaleLabels(labelEl, meters, widthPx) {
+    if (!labelEl || !Number.isFinite(meters) || meters <= 0) return;
+    labelEl.style.width = `${widthPx.toFixed(0)}px`;
+    labelEl.replaceChildren();
+    const midLabel = document.createElement('span');
+    midLabel.className = 'scale-label-mid';
+    midLabel.textContent = formatScaleMeters(meters / 2);
+    labelEl.appendChild(midLabel);
+    const endLabel = document.createElement('span');
+    endLabel.className = 'scale-label-end';
+    endLabel.textContent = formatScaleMeters(meters);
+    labelEl.appendChild(endLabel);
+  }
+  function renderVerticalScaleLabels(labelEl, meters, heightPx) {
+    if (!labelEl || !Number.isFinite(meters) || meters <= 0) return;
+    labelEl.style.height = `${heightPx.toFixed(0)}px`;
+    labelEl.replaceChildren();
+    const midLabel = document.createElement('span');
+    midLabel.className = 'scale-label-mid';
+    midLabel.textContent = formatScaleMeters(meters / 2);
+    labelEl.appendChild(midLabel);
+    const endLabel = document.createElement('span');
+    endLabel.className = 'scale-label-end';
+    endLabel.textContent = formatScaleMeters(meters);
+    labelEl.appendChild(endLabel);
+  }
+  function renderScaleIndicator(indicator, meters, widthPx) {
+    indicator.style.setProperty('--scale-len', `${widthPx.toFixed(0)}px`);
+    indicator.style.width = `${(widthPx + 47).toFixed(0)}px`;
+    indicator.style.height = `${(widthPx + 25).toFixed(0)}px`;
+    renderScaleLabels(indicator.querySelector('.scale-label'), meters, widthPx);
+    const scaleBar = indicator.querySelector('.scale-bar');
+    scaleBar.style.width = `${widthPx.toFixed(0)}px`;
+    renderScaleTicks(scaleBar, meters);
+    renderVerticalScaleLabels(indicator.querySelector('.scale-v-label'), meters, widthPx);
+    const verticalScaleBar = indicator.querySelector('.scale-v-bar');
+    verticalScaleBar.style.height = `${widthPx.toFixed(0)}px`;
+    renderScaleTicks(verticalScaleBar, meters, true);
+    indicator.style.display = 'block';
   }
   function updateScaleIndicator() {
     if (!scaleIndicator || !state || !state.full_canvas || !state.canvas) return;
@@ -3203,18 +3379,18 @@ WEBUI_JS = r"""(() => {
       scaleIndicator.style.display = 'none';
       return;
     }
-    scaleIndicator.querySelector('.scale-label').textContent = formatScaleMeters(meters);
-    scaleIndicator.querySelector('.scale-bar').style.width = `${widthPx.toFixed(0)}px`;
-    scaleIndicator.style.display = 'block';
+    renderScaleIndicator(scaleIndicator, meters, widthPx);
   }
   function draw() {
     if (!state) return;
     const photoOpacity = photoLayerOpacity();
+    const mode = compareMode();
+    const useBasemap = basemapEnabled();
     if (basemapCtx) basemapCtx.clearRect(0, 0, basemapCanvas.width, basemapCanvas.height);
-    if (basemapEnabled() || photoOpacity >= 0.999) {
+    if (useBasemap) {
       gl.clearColor(1, 1, 1, 1);
     } else {
-      gl.clearColor(0.5, 0.5, 0.5, 1);
+      gl.clearColor(0, 0, 0, 1);
     }
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.enable(gl.BLEND);
@@ -3225,6 +3401,9 @@ WEBUI_JS = r"""(() => {
     gl.uniform1f(loc.zoom, zoom);
     gl.uniform2f(loc.pan, pan[0], pan[1]);
     gl.uniform1f(loc.opacity, photoOpacity);
+    gl.uniform1i(loc.compareMode, 0);
+    gl.uniform1f(loc.layerParity, 0);
+    gl.uniform1f(loc.swipeX, hoverScreenX || canvas.width * 0.5);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
     gl.enableVertexAttribArray(loc.uv);
@@ -3232,13 +3411,27 @@ WEBUI_JS = r"""(() => {
     gl.enableVertexAttribArray(loc.pos);
     drawBasemapGl();
     gl.uniform1f(loc.opacity, photoOpacity);
-    for (const layer of layers) {
-      gl.bindTexture(gl.TEXTURE_2D, layer.texture);
-      gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
-      gl.bufferData(gl.ARRAY_BUFFER, layer.pos, gl.STATIC_DRAW);
-      gl.vertexAttribPointer(loc.pos, 2, gl.FLOAT, false, 0, 0);
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.uniform1i(loc.compareMode, 0);
+    gl.uniform1f(loc.layerParity, 0);
+    gl.uniform1f(loc.swipeX, hoverScreenX || canvas.width * 0.5);
+    const focusedLayer = (mode === 'focus' || pairModeActive(mode)) ? layerById(hoverPhotoId) : null;
+    const underLayer = pairModeActive(mode) ? layerById(hoverUnderPhotoId) : null;
+    if (pairModeActive(mode) && focusedLayer && underLayer) {
+      drawPhotoLayer(underLayer, 1, 1, 0);
+      drawPhotoLayer(focusedLayer, 1, 1, 1);
+    } else {
+      for (let i = 0; i < layers.length; i += 1) {
+        const layer = layers[i];
+        if (focusedLayer && layer.id === focusedLayer.id) continue;
+        const displayOpacity = mode === 'focus' ? 0.18 : photoOpacity;
+        drawPhotoLayer(layer, displayOpacity);
+      }
     }
+    if (mode === 'focus' && focusedLayer) {
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      drawPhotoLayer(focusedLayer, 1);
+    }
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     const previewW = Math.round(state.canvas.width);
     const previewH = Math.round(state.canvas.height);
     const full = state.full_canvas || {};
@@ -3400,8 +3593,14 @@ WEBUI_JS = r"""(() => {
   yawModeEl.addEventListener('change', focusStage);
   yawInvertEl.addEventListener('change', focusStage);
   cropOptimizeEl.addEventListener('change', focusStage);
+  compareModeEls.forEach(el => el.addEventListener('change', () => {
+    draw();
+    focusStage();
+  }));
   showCaptureOrderEl.addEventListener('change', draw);
-  showBasemapEl.addEventListener('change', draw);
+  showBasemapEl.addEventListener('change', () => {
+    draw();
+  });
   basemapProviderEls.forEach(el => el.addEventListener('change', draw));
   tabButtons.forEach(btn => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
   document.getElementById('fit').addEventListener('click', fit);
@@ -3539,17 +3738,37 @@ WEBUI_JS = r"""(() => {
       const px = pan[0] + ((ev.clientX - rect.left) * sx) / zoom;
       const py = pan[1] + ((ev.clientY - rect.top) * sy) / zoom;
       let found = null;
+      let under = null;
       for (let i = state.photos.length - 1; i >= 0; i -= 1) {
         const photo = state.photos[i];
         if (pointInPhoto(px, py, photo)) {
-          found = photo;
-          break;
+          if (!found) found = photo;
+          else {
+            under = photo;
+            break;
+          }
         }
+      }
+      const nextHoverId = found ? found.id : null;
+      const nextUnderId = under ? under.id : null;
+      hoverScreenX = (ev.clientX - rect.left) * sx;
+      if (hoverPhotoId !== nextHoverId || hoverUnderPhotoId !== nextUnderId) {
+        hoverPhotoId = nextHoverId;
+        hoverUnderPhotoId = nextUnderId;
+        const mode = compareMode();
+        if (mode === 'focus' || pairModeActive(mode)) draw();
+      } else if (compareMode() === 'pair-swipe') {
+        draw();
       }
       if (found) showTooltip(ev, tooltipText(found)); else hideTooltip();
       return;
     }
     hideTooltip();
+    if (hoverPhotoId !== null || hoverUnderPhotoId !== null) {
+      hoverPhotoId = null;
+      hoverUnderPhotoId = null;
+      if (compareMode() === 'focus' || pairModeActive(compareMode())) draw();
+    }
     const rect = canvas.getBoundingClientRect();
     const sx = canvas.width / rect.width;
     const sy = canvas.height / rect.height;
@@ -3561,7 +3780,14 @@ WEBUI_JS = r"""(() => {
   window.addEventListener('resize', resize);
   window.addEventListener('pagehide', notifyServerShutdown);
   window.addEventListener('beforeunload', notifyServerShutdown);
-  canvas.addEventListener('mouseleave', hideTooltip);
+  canvas.addEventListener('mouseleave', () => {
+    hideTooltip();
+    if (hoverPhotoId !== null || hoverUnderPhotoId !== null) {
+      hoverPhotoId = null;
+      hoverUnderPhotoId = null;
+      if (compareMode() === 'focus' || pairModeActive(compareMode())) draw();
+    }
+  });
   resize();
   setMemoryPolling(5000);
   updateMemoryInfo();
