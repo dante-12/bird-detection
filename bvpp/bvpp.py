@@ -2513,7 +2513,7 @@ WEBUI_HTML = """<!doctype html>
           <div class="radio-stack">
             <label class="check"><input type="radio" name="compareMode" value="normal" checked>None</label>
             <label class="check"><input type="radio" name="compareMode" value="pair-swipe">Swipe</label>
-            <label class="check"><input type="radio" name="compareMode" value="focus">Focus Hover</label>
+            <label class="check"><input type="radio" name="compareMode" value="pair-red-cyan">Red-Cyan</label>
           </div>
         </fieldset>
         <fieldset class="compact">
@@ -2685,6 +2685,12 @@ WEBUI_JS = r"""(() => {
         if ((u_layer_parity < 0.5 && !showLeft) || (u_layer_parity > 0.5 && showLeft)) discard;
       }
       vec4 c = texture2D(u_tex, v_uv);
+      if (u_compare_mode == 2) {
+        float gray = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+        vec3 falseColor = u_layer_parity < 0.5 ? vec3(gray, 0.0, 0.0) : vec3(0.0, gray, gray);
+        gl_FragColor = vec4(falseColor, c.a * u_opacity);
+        return;
+      }
       gl_FragColor = vec4(c.rgb, c.a * u_opacity);
     }`;
 
@@ -3160,7 +3166,10 @@ WEBUI_JS = r"""(() => {
     return checked ? checked.value : 'normal';
   }
   function pairModeActive(mode) {
-    return mode === 'pair-swipe';
+    return mode === 'pair-swipe' || mode === 'pair-red-cyan';
+  }
+  function pairModeShader(mode) {
+    return mode === 'pair-red-cyan' ? 2 : 1;
   }
   function layerById(id) {
     return id == null ? null : layers.find(layer => layer.id === id) || null;
@@ -3177,13 +3186,12 @@ WEBUI_JS = r"""(() => {
   }
   function drawLayerOutlines(ctx) {
     const mode = compareMode();
-    if ((mode !== 'focus' && mode !== 'pair-swipe') || !layers.length) return;
+    if (!pairModeActive(mode) || !layers.length) return;
     ctx.save();
     ctx.lineWidth = 2;
     ctx.lineJoin = 'round';
     ctx.setLineDash([]);
     for (let i = 0; i < layers.length; i += 1) {
-      if (mode === 'focus' && layers[i].id !== hoverPhotoId) continue;
       if (pairModeActive(mode) && layers[i].id !== hoverPhotoId && layers[i].id !== hoverUnderPhotoId) continue;
       const p = layers[i].pos;
       if (!p || p.length < 12) continue;
@@ -3414,22 +3422,19 @@ WEBUI_JS = r"""(() => {
     gl.uniform1i(loc.compareMode, 0);
     gl.uniform1f(loc.layerParity, 0);
     gl.uniform1f(loc.swipeX, hoverScreenX || canvas.width * 0.5);
-    const focusedLayer = (mode === 'focus' || pairModeActive(mode)) ? layerById(hoverPhotoId) : null;
+    const focusedLayer = pairModeActive(mode) ? layerById(hoverPhotoId) : null;
     const underLayer = pairModeActive(mode) ? layerById(hoverUnderPhotoId) : null;
     if (pairModeActive(mode) && focusedLayer && underLayer) {
-      drawPhotoLayer(underLayer, 1, 1, 0);
-      drawPhotoLayer(focusedLayer, 1, 1, 1);
+      const shaderMode = pairModeShader(mode);
+      if (shaderMode === 2) gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+      drawPhotoLayer(underLayer, 1, shaderMode, 0);
+      drawPhotoLayer(focusedLayer, 1, shaderMode, 1);
     } else {
       for (let i = 0; i < layers.length; i += 1) {
         const layer = layers[i];
         if (focusedLayer && layer.id === focusedLayer.id) continue;
-        const displayOpacity = mode === 'focus' ? 0.18 : photoOpacity;
-        drawPhotoLayer(layer, displayOpacity);
+        drawPhotoLayer(layer, photoOpacity);
       }
-    }
-    if (mode === 'focus' && focusedLayer) {
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-      drawPhotoLayer(focusedLayer, 1);
     }
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     const previewW = Math.round(state.canvas.width);
@@ -3756,7 +3761,7 @@ WEBUI_JS = r"""(() => {
         hoverPhotoId = nextHoverId;
         hoverUnderPhotoId = nextUnderId;
         const mode = compareMode();
-        if (mode === 'focus' || pairModeActive(mode)) draw();
+        if (pairModeActive(mode)) draw();
       } else if (compareMode() === 'pair-swipe') {
         draw();
       }
@@ -3767,7 +3772,7 @@ WEBUI_JS = r"""(() => {
     if (hoverPhotoId !== null || hoverUnderPhotoId !== null) {
       hoverPhotoId = null;
       hoverUnderPhotoId = null;
-      if (compareMode() === 'focus' || pairModeActive(compareMode())) draw();
+      if (pairModeActive(compareMode())) draw();
     }
     const rect = canvas.getBoundingClientRect();
     const sx = canvas.width / rect.width;
@@ -3785,7 +3790,7 @@ WEBUI_JS = r"""(() => {
     if (hoverPhotoId !== null || hoverUnderPhotoId !== null) {
       hoverPhotoId = null;
       hoverUnderPhotoId = null;
-      if (compareMode() === 'focus' || pairModeActive(compareMode())) draw();
+      if (pairModeActive(compareMode())) draw();
     }
   });
   resize();
