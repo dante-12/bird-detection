@@ -92,17 +92,23 @@ Image.MAX_IMAGE_PIXELS = None
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
 MAX_JPG_TIF_DIM_PX = 64000
 MEMORY_SAFETY_MARGIN_BYTES = 512 * 1024 * 1024
+ABS_REL_ALT_CHANGE_THRESHOLD_M = 0.15
+AREA_MASK_MAX_DIM_PX = 4096
 
 # Metadata keys we expect to use (as seen by exifread)
 INSPECT_KEYS: Dict[str, Tuple[str, ...]] = {
     "lat": ("GPS Latitude", "XMP DJI:GPSLatitude", "XMP exif:GPSLatitude", "GPS Position"),
     "lon": ("GPS Longitude", "XMP DJI:GPSLongitude", "XMP exif:GPSLongitude", "GPS Position"),
     "alt": ("Relative Altitude", "XMP DJI:RelativeAltitude", "XMP DJI:RelativeAltitudeMeters", "GPS GPSAltitude"),
+    "absolute_alt": ("Absolute Altitude", "XMP DJI:AbsoluteAltitude", "GPS GPSAltitude"),
     "flight_yaw": ("Flight Yaw Degree", "XMP DJI:FlightYawDegree", "XMP DJI:FlightYaw"),
     "gimbal_yaw": ("Gimbal Yaw Degree", "XMP DJI:GimbalYawDegree", "XMP DJI:GimbalYaw"),
     "gimbal_pitch": ("Gimbal Pitch Degree", "XMP DJI:GimbalPitchDegree", "XMP DJI:GimbalPitch"),
     "flight_pitch": ("Flight Pitch Degree", "XMP DJI:FlightPitchDegree", "XMP DJI:FlightPitch"),
     "flight_roll": ("Flight Roll Degree", "XMP DJI:FlightRollDegree", "XMP DJI:FlightRoll"),
+    "flight_x_speed": ("Flight X Speed", "XMP DJI:FlightXSpeed"),
+    "flight_y_speed": ("Flight Y Speed", "XMP DJI:FlightYSpeed"),
+    "flight_z_speed": ("Flight Z Speed", "XMP DJI:FlightZSpeed"),
     "fov": (
         "XMP Camera:FieldOfView",
         "XMP DJI:CameraFOV",
@@ -127,6 +133,7 @@ class PhotoMeta:
     alt_m: float
     yaw_deg: float  # clockwise from true north
     hfov_deg: float
+    absolute_alt_m: Optional[float] = None
     flight_yaw_deg: Optional[float] = None
     gimbal_yaw_deg: Optional[float] = None
     pitch_deg: float = -90.0  # degrees; -90 is nadir
@@ -134,6 +141,9 @@ class PhotoMeta:
     gimbal_pitch_deg: Optional[float] = None
     gimbal_roll_deg: Optional[float] = None
     flight_roll_deg: Optional[float] = None
+    flight_x_speed_mps: Optional[float] = None
+    flight_y_speed_mps: Optional[float] = None
+    flight_z_speed_mps: Optional[float] = None
     product_name: Optional[str] = None
     unique_camera_model: Optional[str] = None
     captured_at: Optional[str] = None
@@ -818,7 +828,25 @@ def _read_exiftool_json(path: str) -> Dict[str, object]:
     if v is not None:
         out["Flight Roll Degree"] = v
 
+    for axis in ("X", "Y", "Z"):
+        v = _first(
+            f"XMP-drone-dji:Flight{axis}Speed",
+            f"XMP-drone-dji:Flight{axis}Speed#",
+            f"XMP:Flight{axis}Speed",
+            f"Flight{axis}Speed",
+        )
+        if v is not None:
+            out[f"Flight {axis} Speed"] = v
+
     # Altitude
+    v = _first(
+        "XMP:AbsoluteAltitude",
+        "XMP-drone-dji:AbsoluteAltitude",
+        "AbsoluteAltitude",
+    )
+    if v is not None:
+        out["Absolute Altitude"] = v
+
     v = _first(
         "XMP:RelativeAltitude",
         "XMP-drone-dji:RelativeAltitude",
@@ -994,6 +1022,28 @@ def _extract_alt(tags: Dict[str, object]) -> Optional[float]:
     return float(alt)
 
 
+def _extract_absolute_alt(tags: Dict[str, object]) -> Optional[float]:
+    absolute_alt = _extract_first_float(
+        tags,
+        (
+            "Absolute Altitude",
+            "XMP DJI:AbsoluteAltitude",
+            "XMP:AbsoluteAltitude",
+        ),
+    )
+    if absolute_alt is not None:
+        return float(absolute_alt)
+
+    alt_tag = tags.get("GPS GPSAltitude")
+    alt_ref = tags.get("GPS GPSAltitudeRef")
+    alt = _try_parse_float(alt_tag)
+    if alt is None:
+        return None
+    if alt_ref is not None and str(alt_ref).strip() in ("1", "Below Sea Level"):
+        alt = -alt
+    return float(alt)
+
+
 def _extract_yaw(tags: Dict[str, object], options: Optional[RenderOptions] = None) -> Optional[float]:
     """Extract yaw in degrees (clockwise from true north).
 
@@ -1126,6 +1176,18 @@ def _extract_flight_roll(tags: Dict[str, object]) -> Optional[float]:
     )
 
 
+def _extract_flight_speed(tags: Dict[str, object], axis: str) -> Optional[float]:
+    return _extract_first_float(
+        tags,
+        (
+            f"Flight {axis} Speed",
+            f"XMP DJI:Flight{axis}Speed",
+            f"XMP:Flight{axis}Speed",
+            f"Flight{axis}Speed",
+        ),
+    )
+
+
 def _extract_pitch(tags: Dict[str, object]) -> Optional[float]:
     """Combine flight + gimbal pitch when present.
 
@@ -1220,12 +1282,16 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
 
     lat, lon = _extract_lat_lon(tags)
     alt = _extract_alt(tags)
+    absolute_alt = _extract_absolute_alt(tags)
     yaw = _extract_yaw(tags, options)
     pitch = _extract_pitch(tags)
     flight_yaw = _extract_flight_yaw(tags)
     gimbal_yaw = _extract_gimbal_yaw(tags)
     flight_pitch = _extract_flight_pitch(tags)
     flight_roll = _extract_flight_roll(tags)
+    flight_x_speed = _extract_flight_speed(tags, "X")
+    flight_y_speed = _extract_flight_speed(tags, "Y")
+    flight_z_speed = _extract_flight_speed(tags, "Z")
     gimbal_pitch = _extract_gimbal_pitch(tags)
     gimbal_roll = _extract_gimbal_roll(tags)
     product_name = _extract_first_text(
@@ -1294,6 +1360,7 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
         lat_deg=float(lat),
         lon_deg=float(lon),
         alt_m=float(alt),
+        absolute_alt_m=float(absolute_alt) if absolute_alt is not None else None,
         yaw_deg=float(yaw) % 360.0,
         flight_yaw_deg=float(flight_yaw) % 360.0 if flight_yaw is not None else None,
         gimbal_yaw_deg=float(gimbal_yaw) % 360.0 if gimbal_yaw is not None else None,
@@ -1303,6 +1370,9 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
         gimbal_pitch_deg=float(gimbal_pitch) if gimbal_pitch is not None else None,
         gimbal_roll_deg=float(gimbal_roll) if gimbal_roll is not None else None,
         flight_roll_deg=float(flight_roll) if flight_roll is not None else None,
+        flight_x_speed_mps=float(flight_x_speed) if flight_x_speed is not None else None,
+        flight_y_speed_mps=float(flight_y_speed) if flight_y_speed is not None else None,
+        flight_z_speed_mps=float(flight_z_speed) if flight_z_speed is not None else None,
         product_name=product_name,
         unique_camera_model=unique_camera_model,
         captured_at=captured_at,
@@ -2405,6 +2475,8 @@ WEBUI_HTML = """<!doctype html>
     #hud { min-width: 250px; padding: 8px 10px; border-radius: 6px; background: rgba(255,255,255,.88); box-shadow: 0 1px 6px rgba(0,0,0,.16); font-size: 12px; line-height: 1.35; }
     #saveStatusPanel { display: none; min-width: 250px; max-width: 360px; padding: 7px 10px; border-radius: 6px; background: rgba(255,255,255,.9); box-shadow: 0 1px 6px rgba(0,0,0,.16); }
     #saveStatusPanel.active, #saveStatusPanel.has-status { display: block; }
+    #rulerModeIndicator { position: absolute; right: 12px; top: 12px; display: none; padding: 7px 12px; border-radius: 999px; color: #174ea6; background: #e8f0fe; border: 1px solid #1a73e8; box-shadow: 0 1px 6px rgba(0,0,0,.16); font-size: 12px; font-weight: 700; letter-spacing: .04em; pointer-events: none; }
+    #rulerModeIndicator.active { display: block; }
     #scaleIndicator { --scale-len: 120px; position: absolute; left: 12px; bottom: 10px; display: none; min-width: 72px; color: #202124; font-size: 12px; line-height: 1; pointer-events: none; }
     #scaleIndicator::before { content: ""; position: absolute; left: 0; bottom: 0; z-index: 0; width: calc(var(--scale-len) + 47px); height: calc(var(--scale-len) + 25px); border-radius: 5px; background: rgba(255,255,255,.86); box-shadow: 0 1px 5px rgba(0,0,0,.16); clip-path: polygon(0 0, 42px 0, 42px calc(100% - 19px), 100% calc(100% - 19px), 100% 100%, 0 100%); }
     .scale-indicator .scale-label, .scale-indicator .scale-bar, .scale-indicator .scale-v-label, .scale-indicator .scale-v-bar { z-index: 1; }
@@ -2444,9 +2516,20 @@ WEBUI_HTML = """<!doctype html>
     legend { padding: 0 4px; color: #3c4043; font-size: 12px; font-weight: 600; }
     label { display: grid; gap: 4px; font-size: 12px; color: #5f6368; }
     .control-stack { display: grid; gap: 8px; align-content: start; }
+    .adjustment-controls .control-stack { gap: 4px; }
+    .adjustment-controls button { box-sizing: border-box; height: 22px; padding: 0 8px; font-size: 12px; line-height: 20px; }
+    .ruler-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .adjustment-controls .ruler-controls { gap: 4px; }
     .control-row { display: flex; align-items: end; gap: 8px; }
     .info-lines { white-space: pre-line; color: #5f6368; font-size: 12px; line-height: 1.35; }
     .compact { min-width: 180px; }
+    .image-rotation { flex: 0 0 135px; min-width: 135px; }
+    .image-opacity { flex: 0 0 150px; min-width: 150px; }
+    .image-opacity input[type="range"] { width: 140px; }
+    .image-overlap { flex: 0 0 130px; min-width: 130px; }
+    .image-overlap .radio-stack { gap: 0; }
+    .image-overlap .check { height: 24px; }
+    .image-shortcuts { flex: 0 0 145px; min-width: 145px; }
     .save-options { flex: 0 0 220px; width: 220px; max-width: 220px; }
     .save-options .info-lines { white-space: normal; overflow-wrap: anywhere; }
     .wide { min-width: 290px; max-width: 360px; }
@@ -2457,16 +2540,21 @@ WEBUI_HTML = """<!doctype html>
     input[type="range"] { width: 160px; }
     select, button { padding: 6px 8px; }
     button { cursor: pointer; border: 1px solid #b9c0c7; border-radius: 6px; background: #fff; }
+    button.active { border-color: #1a73e8; color: #174ea6; background: #e8f0fe; }
     button:disabled { cursor: default; opacity: .55; }
     .check { display: flex; align-items: center; gap: 6px; height: 30px; }
     .radio-stack { display: grid; gap: 5px; padding-left: 18px; }
     .attribution { color: #5f6368; font-size: 11px; line-height: 1.3; }
     #status { min-width: 220px; font-size: 12px; color: #5f6368; overflow-wrap: anywhere; }
+    #altitudeShiftWarning { display: none; margin-top: 6px; max-width: 340px; font-size: 12px; line-height: 1.4; color: #d93025; font-weight: 650; overflow-wrap: anywhere; }
+    #altitudeShiftWarning.active { display: block; }
     #saveActivity { display: none; width: 100%; height: 16px; margin-top: 4px; overflow: hidden; border-radius: 999px; background: #eef2f7; position: relative; }
     #saveActivity.active { display: block; }
     #saveActivity::before { content: ">>>"; position: absolute; left: -42px; top: 0; color: #1a73e8; font-size: 13px; line-height: 16px; font-weight: 700; letter-spacing: 3px; animation: save-arrow-run 1.05s linear infinite; }
     @keyframes save-arrow-run { from { transform: translateX(0); } to { transform: translateX(270px); } }
-    #tooltip { position: fixed; z-index: 10; display: none; max-width: 360px; padding: 8px 10px; border-radius: 6px; background: rgba(32,33,36,.92); color: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.45; white-space: pre; pointer-events: none; box-shadow: 0 2px 10px rgba(0,0,0,.25); }
+    #tooltip { position: fixed; z-index: 10; display: none; max-width: 420px; padding: 8px 10px; border-radius: 6px; background: rgba(32,33,36,.92); color: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.45; white-space: pre; pointer-events: none; box-shadow: 0 2px 10px rgba(0,0,0,.25); }
+    #tooltip .altitude-alert { color: #ff6b6b; font-weight: 700; }
+    #tooltip.message { white-space: normal; }
   </style>
 </head>
 <body>
@@ -2479,9 +2567,11 @@ WEBUI_HTML = """<!doctype html>
         <div id="hud">Loading...</div>
         <div id="saveStatusPanel">
           <div id="status"></div>
+          <div id="altitudeShiftWarning"></div>
           <div id="saveActivity"></div>
         </div>
       </div>
+      <div id="rulerModeIndicator" role="status">EDIT RULER MODE</div>
       <div id="scaleIndicator" class="scale-indicator"><div class="scale-v-label"></div><div class="scale-v-bar"></div><div class="scale-label"></div><div class="scale-bar"></div></div>
       <div id="tooltip"></div>
     </div>
@@ -2491,6 +2581,7 @@ WEBUI_HTML = """<!doctype html>
         <button class="tab-button" data-tab="misc" type="button">Misc. Control</button>
         <button class="tab-button" data-tab="save" type="button">Save</button>
         <button class="tab-button" data-tab="exif" type="button">Exif Info</button>
+        <button class="tab-button" data-tab="area" type="button">Area</button>
       </div>
       <div class="tab-panel active" data-panel="image">
         <fieldset class="compact">
@@ -2500,15 +2591,15 @@ WEBUI_HTML = """<!doctype html>
             <div id="cameraWaterInfo" class="info-lines"></div>
           </div>
         </fieldset>
-        <fieldset class="compact">
+        <fieldset class="compact image-rotation">
           <legend>Rotation Correction</legend>
           <label>Degree<input id="yaw" type="text" inputmode="decimal"></label>
         </fieldset>
-        <fieldset class="compact">
+        <fieldset class="compact image-opacity">
           <legend>Transparency (%)</legend>
           <label>Opacity <input id="opacity" type="range" min="0" max="100"><span id="opacityText"></span></label>
         </fieldset>
-        <fieldset class="compact">
+        <fieldset class="compact image-overlap">
           <legend>Overlap Effect</legend>
           <div class="radio-stack">
             <label class="check"><input type="radio" name="compareMode" value="normal" checked>None</label>
@@ -2516,14 +2607,18 @@ WEBUI_HTML = """<!doctype html>
             <label class="check"><input type="radio" name="compareMode" value="pair-red-cyan">Red-Cyan</label>
           </div>
         </fieldset>
-        <fieldset class="compact">
+        <fieldset class="compact image-shortcuts">
           <legend>Keyboard Shortcuts</legend>
           <div id="shortcutInfo" class="info-lines"></div>
         </fieldset>
-        <fieldset class="compact">
+        <fieldset class="compact adjustment-controls">
           <legend>Adjustment Controls</legend>
           <div class="control-stack">
             <button id="fit">Fit to View</button>
+            <div class="ruler-controls">
+              <button id="rulerMode" type="button">Edit Ruler</button>
+              <button id="clearRuler" type="button">Clear Ruler</button>
+            </div>
             <button id="revert">Reset Adjustments</button>
           </div>
         </fieldset>
@@ -2575,8 +2670,12 @@ WEBUI_HTML = """<!doctype html>
           <div id="exifProductInfo" class="info-lines"></div>
         </fieldset>
         <fieldset class="exif-group">
-          <legend>Relative Altitude</legend>
+          <legend>Altitude</legend>
           <div id="relativeAltitudeInfo" class="info-lines"></div>
+        </fieldset>
+        <fieldset class="exif-group">
+          <legend>Flight Speed</legend>
+          <div id="exifSpeedInfo" class="info-lines"></div>
         </fieldset>
         <fieldset class="exif-group">
           <legend>Pitch</legend>
@@ -2589,6 +2688,12 @@ WEBUI_HTML = """<!doctype html>
         <fieldset class="exif-group">
           <legend>Yaw</legend>
           <div id="exifYawInfo" class="info-lines"></div>
+        </fieldset>
+      </div>
+      <div class="tab-panel" data-panel="area">
+        <fieldset class="wide">
+          <legend>Mosaic Area</legend>
+          <div id="areaInfo" class="info-lines"></div>
         </fieldset>
       </div>
     </div>
@@ -2619,6 +2724,7 @@ WEBUI_JS = r"""(() => {
   const saveStatusPanel = document.getElementById('saveStatusPanel');
   const tooltip = document.getElementById('tooltip');
   const statusEl = document.getElementById('status');
+  const altitudeShiftWarningEl = document.getElementById('altitudeShiftWarning');
   const saveActivityEl = document.getElementById('saveActivity');
   const altEl = document.getElementById('alt');
   const yawEl = document.getElementById('yaw');
@@ -2627,6 +2733,9 @@ WEBUI_JS = r"""(() => {
   const opacityEl = document.getElementById('opacity');
   const opacityTextEl = document.getElementById('opacityText');
   const compareModeEls = Array.from(document.querySelectorAll('input[name="compareMode"]'));
+  const rulerModeBtn = document.getElementById('rulerMode');
+  const clearRulerBtn = document.getElementById('clearRuler');
+  const rulerModeIndicatorEl = document.getElementById('rulerModeIndicator');
   const cropOptimizeEl = document.getElementById('cropOptimize');
   const showCaptureOrderEl = document.getElementById('showCaptureOrder');
   const showBasemapEl = document.getElementById('showBasemap');
@@ -2644,9 +2753,11 @@ WEBUI_JS = r"""(() => {
   const yawDescriptionEl = document.getElementById('yawDescription');
   const shortcutInfoEl = document.getElementById('shortcutInfo');
   const exifProductInfoEl = document.getElementById('exifProductInfo');
+  const exifSpeedInfoEl = document.getElementById('exifSpeedInfo');
   const exifPitchInfoEl = document.getElementById('exifPitchInfo');
   const exifRollInfoEl = document.getElementById('exifRollInfo');
   const exifYawInfoEl = document.getElementById('exifYawInfo');
+  const areaInfoEl = document.getElementById('areaInfo');
   const tabButtons = Array.from(document.querySelectorAll('.tab-button'));
   const tabPanels = Array.from(document.querySelectorAll('.tab-panel'));
   const basemapCtx = basemapCanvas.getContext('2d');
@@ -2742,15 +2853,34 @@ WEBUI_JS = r"""(() => {
   let hoverScreenX = 0;
   let shutdownSent = false;
   let lastCommittedNumberText = "";
+  let mouseDownPos = null;
+  let mouseDragged = false;
+  let rulerMode = false;
+  let ruler = null;
+  let rulerDrag = null;
+  let rulerSuppressClick = false;
+  let shownSaveError = null;
+  let areaStatsTimer = null;
+  let areaStatsGeneration = 0;
+  const areaStatsIdleMs = 500;
   const tileCache = new Map();
+  const altitudeShiftPanelWarningText = 'The offset between Relative Altitude and the actual altitude appears to have changed during the flight. In this case, the required altitude correction is likely to differ by location. Check "Show Capture Order" to identify where the offset changed, split the images before and after each change into separate folders, and process them separately.';
+  const altitudeShiftArrowWarningText = 'The actual altitude appears to have diverged from Relative Altitude. We recommend moving this and subsequent images to a separate folder and processing them separately.';
 
   function refreshSaveStatusPanel() {
-    if (!saveStatusPanel || !statusEl || !saveActivityEl) return;
-    saveStatusPanel.classList.toggle('has-status', !!statusEl.textContent);
+    if (!saveStatusPanel || !statusEl || !altitudeShiftWarningEl || !saveActivityEl) return;
+    saveStatusPanel.classList.toggle('has-status', !!statusEl.textContent || altitudeShiftWarningEl.classList.contains('active'));
     saveStatusPanel.classList.toggle('active', saveActivityEl.classList.contains('active'));
   }
   function setStatus(text) {
     statusEl.textContent = text || '';
+    refreshSaveStatusPanel();
+  }
+  function updateAltitudeShiftWarning() {
+    if (!altitudeShiftWarningEl) return;
+    const hasWarning = !!(state && Array.isArray(state.sequence) && state.sequence.some(item => item.altitude_shift_from_previous));
+    altitudeShiftWarningEl.textContent = hasWarning ? altitudeShiftPanelWarningText : '';
+    altitudeShiftWarningEl.classList.toggle('active', hasWarning);
     refreshSaveStatusPanel();
   }
   function basemapProvider() {
@@ -2787,17 +2917,20 @@ WEBUI_JS = r"""(() => {
   }
   function updateExifGroups(lines) {
     const product = [];
+    const speed = [];
     const pitch = [];
     const roll = [];
     const yaw = [];
     for (const line of Array.isArray(lines) ? lines : []) {
       if (/^(Product Name|Unique Camera Model|FOV)\b/.test(line)) product.push(line);
+      else if (/^Flight [XYZ] Speed\b/.test(line)) speed.push(line);
       else if (/Pitch\b/.test(line)) pitch.push(line);
       else if (/Roll\b/.test(line)) roll.push(line);
       else if (/Yaw\b/.test(line)) yaw.push(line);
       else product.push(line);
     }
     setLines(exifProductInfoEl, product);
+    setLines(exifSpeedInfoEl, speed);
     setLines(exifPitchInfoEl, pitch);
     setLines(exifRollInfoEl, roll);
     setLines(exifYawInfoEl, yaw);
@@ -2809,23 +2942,82 @@ WEBUI_JS = r"""(() => {
     setLines(yawDescriptionEl, state.info.yaw_description_lines);
     setLines(shortcutInfoEl, state.info.shortcut_lines);
     updateExifGroups(state.info.exif_lines);
+    updateAltitudeShiftWarning();
+  }
+  function showAreaStats(area) {
+    const areaPrefix = area.approximate ? 'Approx. ' : '';
+    setLines(areaInfoEl, [
+      `${areaPrefix}Mosaic Image Area: ${formatArea(area.mosaic_area_m2)}`,
+      `${areaPrefix}Overlapping Area: ${formatArea(area.overlap_area_m2)}`,
+      `${areaPrefix}Overlap Ratio: ${fmtNum(area.overlap_pct)} %`,
+    ]);
+  }
+  function isAreaTabActive() {
+    return tabPanels.some(panel => panel.dataset.panel === 'area' && panel.classList.contains('active'));
+  }
+  function invalidateAreaStats() {
+    areaStatsGeneration += 1;
+    clearTimeout(areaStatsTimer);
+    areaStatsTimer = null;
+    if (isAreaTabActive()) setLines(areaInfoEl, 'Waiting for adjustment to stop...');
+  }
+  async function loadAreaStats(generation) {
+    if (!isAreaTabActive() || generation !== areaStatsGeneration) return;
+    setLines(areaInfoEl, 'Calculating...');
+    try {
+      const res = await fetch('/api/area-stats');
+      const area = await res.json();
+      if (!isAreaTabActive() || generation !== areaStatsGeneration) return;
+      showAreaStats(area);
+    } catch (err) {
+      if (isAreaTabActive() && generation === areaStatsGeneration) {
+        setLines(areaInfoEl, `Area calculation failed: ${err}`);
+      }
+    }
+  }
+  function scheduleAreaStats() {
+    if (!isAreaTabActive()) return;
+    clearTimeout(areaStatsTimer);
+    const generation = ++areaStatsGeneration;
+    setLines(areaInfoEl, 'Waiting for adjustment to stop...');
+    areaStatsTimer = setTimeout(() => loadAreaStats(generation), areaStatsIdleMs);
   }
   function photoById(id) {
     if (!state || !state.photos) return null;
     return state.photos.find(photo => photo.id === id) || null;
   }
   function fmtNum(value) {
-    return Number.isFinite(Number(value)) ? Number(value).toFixed(2) : 'N/A';
+    return value !== null && value !== undefined && Number.isFinite(Number(value)) ? Number(value).toFixed(2) : 'N/A';
   }
-  function tooltipText(photo) {
-    return `File\n` +
-      `  ${photo.name}\n\n` +
-      `Exif\n` +
-      `  Relative Altitude [m] : ${fmtNum(photo.alt_m)}\n` +
-      `  Flight Pitch [degree] : ${fmtNum(photo.flight_pitch_deg)}\n` +
-      `  Gimbal Pitch [degree] : ${fmtNum(photo.gimbal_pitch_deg)}\n` +
-      `  Flight Yaw Degree     : ${fmtNum(photo.flight_yaw_deg)}\n` +
-      `  Gimbal Yaw Degree     : ${fmtNum(photo.gimbal_yaw_deg)}`;
+  function formatArea(value) {
+    const area = Number(value);
+    if (!Number.isFinite(area)) return 'N/A';
+    if (area >= 1000000) return `${(area / 1000000).toFixed(3)} km\u00b2`;
+    return `${area.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} m\u00b2`;
+  }
+  function fmtSpeed(value) {
+    return value !== null && value !== undefined && Number.isFinite(Number(value)) ? Number(value).toFixed(1) : 'N/A';
+  }
+  function fmtAltDifference(absoluteAlt, relativeAlt) {
+    if (absoluteAlt === null || absoluteAlt === undefined || relativeAlt === null || relativeAlt === undefined) return 'N/A';
+    return fmtNum(Number(absoluteAlt) - Number(relativeAlt));
+  }
+  function tooltipLines(photo) {
+    return [
+      { text: 'File' },
+      { text: `  ${photo.name}` },
+      { text: '' },
+      { text: 'Exif' },
+      { text: `  Relative Altitude [m] : ${fmtNum(photo.alt_m)}`, altitude: true },
+      { text: `  Absolute Altitude [m] : ${fmtNum(photo.absolute_alt_m)}`, altitude: true },
+      { text: `  Abs - Rel Alt. [m]    : ${fmtAltDifference(photo.absolute_alt_m, photo.alt_m)}`, altitude: true },
+      { text: `  Flight Pitch [degree] : ${fmtNum(photo.flight_pitch_deg)}` },
+      { text: `  Gimbal Pitch [degree] : ${fmtNum(photo.gimbal_pitch_deg)}` },
+      { text: `  Flight Roll [degree]  : ${fmtNum(photo.flight_roll_deg)}` },
+      { text: `  Flight Yaw Degree     : ${fmtNum(photo.flight_yaw_deg)}` },
+      { text: `  Gimbal Yaw Degree     : ${fmtNum(photo.gimbal_yaw_deg)}` },
+      { text: `  Flight X/Y/Z Speed: ${fmtSpeed(photo.flight_x_speed_mps)}/${fmtSpeed(photo.flight_y_speed_mps)}/${fmtSpeed(photo.flight_z_speed_mps)} [m/s]` },
+    ];
   }
   function pointInTri(px, py, a, b, c) {
     const v0x = c[0] - a[0], v0y = c[1] - a[1];
@@ -2848,8 +3040,195 @@ WEBUI_JS = r"""(() => {
     if (!c || c.length < 4) return false;
     return pointInTri(px, py, c[0], c[1], c[2]) || pointInTri(px, py, c[0], c[2], c[3]);
   }
+  function bilinearPoint(photo, u, v) {
+    const c = photo && photo.corners;
+    if (!c || c.length < 4) return [0, 0];
+    const a = c[0], b = c[1], d = c[3], q = [
+      c[0][0] - c[1][0] + c[2][0] - c[3][0],
+      c[0][1] - c[1][1] + c[2][1] - c[3][1],
+    ];
+    return [
+      a[0] + (b[0] - a[0]) * u + (d[0] - a[0]) * v + q[0] * u * v,
+      a[1] + (b[1] - a[1]) * u + (d[1] - a[1]) * v + q[1] * u * v,
+    ];
+  }
+  function solveBilinearLocal(photo, px, py) {
+    const c = photo && photo.corners;
+    if (!c || c.length < 4) return null;
+    const a = c[0], b = c[1], d = c[3], q = [
+      c[0][0] - c[1][0] + c[2][0] - c[3][0],
+      c[0][1] - c[1][1] + c[2][1] - c[3][1],
+    ];
+    let u = 0.5;
+    let v = 0.5;
+    for (let i = 0; i < 12; i += 1) {
+      const x = a[0] + (b[0] - a[0]) * u + (d[0] - a[0]) * v + q[0] * u * v;
+      const y = a[1] + (b[1] - a[1]) * u + (d[1] - a[1]) * v + q[1] * u * v;
+      const fx = x - px;
+      const fy = y - py;
+      if (Math.hypot(fx, fy) < 1e-4) break;
+      const j00 = (b[0] - a[0]) + q[0] * v;
+      const j01 = (d[0] - a[0]) + q[0] * u;
+      const j10 = (b[1] - a[1]) + q[1] * v;
+      const j11 = (d[1] - a[1]) + q[1] * u;
+      const det = j00 * j11 - j01 * j10;
+      if (Math.abs(det) < 1e-9) break;
+      u -= (j11 * fx - j01 * fy) / det;
+      v -= (-j10 * fx + j00 * fy) / det;
+    }
+    return { u, v };
+  }
+  function photoAtPreview(px, py) {
+    if (!state || !Array.isArray(state.photos)) return null;
+    for (let i = state.photos.length - 1; i >= 0; i -= 1) {
+      if (pointInPhoto(px, py, state.photos[i])) return state.photos[i];
+    }
+    return null;
+  }
+  function clientToPreview(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const sx = canvas.width / rect.width;
+    const sy = canvas.height / rect.height;
+    return {
+      px: pan[0] + ((clientX - rect.left) * sx) / zoom,
+      py: pan[1] + ((clientY - rect.top) * sy) / zoom,
+      sx,
+      sy,
+      screenX: (clientX - rect.left) * sx,
+    };
+  }
+  function previewToRulerPoint(px, py, preferredPhotoId = null) {
+    const preferred = preferredPhotoId == null ? null : photoById(preferredPhotoId);
+    const photo = preferred || photoAtPreview(px, py);
+    if (photo) {
+      const local = solveBilinearLocal(photo, px, py);
+      if (local) return { photoId: photo.id, u: local.u, v: local.v };
+    }
+    return { preview: [px, py] };
+  }
+  function rulerPointToPreview(point) {
+    if (!point) return null;
+    if (point.photoId != null) {
+      const photo = photoById(point.photoId);
+      if (photo) return bilinearPoint(photo, Number(point.u || 0), Number(point.v || 0));
+    }
+    return Array.isArray(point.preview) ? [Number(point.preview[0] || 0), Number(point.preview[1] || 0)] : null;
+  }
+  function rulerMeters(a, b) {
+    const mpp = Number(state && state.full_canvas && state.full_canvas.mpp);
+    const scale = Number(state && state.canvas && state.canvas.scale);
+    if (!Number.isFinite(mpp) || mpp <= 0 || !Number.isFinite(scale) || scale <= 0) return NaN;
+    return Math.hypot(b[0] - a[0], b[1] - a[1]) * (mpp / scale);
+  }
+  function formatRulerMeters(meters) {
+    if (!Number.isFinite(meters)) return 'N/A';
+    if (meters >= 1000) return `${(meters / 1000).toFixed(meters >= 10000 ? 2 : 3)} km`;
+    if (meters >= 10) return `${meters.toFixed(2)} m`;
+    if (meters >= 1) return `${meters.toFixed(3)} m`;
+    return `${(meters * 100).toFixed(1)} cm`;
+  }
+  function screenDistanceToSegment(p, a, b) {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const len2 = dx * dx + dy * dy;
+    if (len2 <= 1e-9) return Math.hypot(p[0] - a[0], p[1] - a[1]);
+    const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2));
+    return Math.hypot(p[0] - (a[0] + dx * t), p[1] - (a[1] + dy * t));
+  }
+  function rulerHitAtClient(clientX, clientY) {
+    if (!ruler || !ruler.start) return null;
+    const p = clientToPreview(clientX, clientY);
+    const a = rulerPointToPreview(ruler.start);
+    const b = rulerPointToPreview(ruler.end);
+    if (!a || !b) return null;
+    const ps = [(p.px - pan[0]) * zoom, (p.py - pan[1]) * zoom];
+    const as = previewToScreen(a);
+    const bs = previewToScreen(b);
+    const handleRadius = 11 * Math.max(1, p.sx / Math.max(p.sy, 1));
+    if (Math.hypot(ps[0] - as[0], ps[1] - as[1]) <= handleRadius) return { kind: 'start' };
+    if (Math.hypot(ps[0] - bs[0], ps[1] - bs[1]) <= handleRadius) return { kind: 'end' };
+    if (ruler.complete && screenDistanceToSegment(ps, as, bs) <= 8) return { kind: 'move' };
+    return null;
+  }
+  function setRulerMode(active) {
+    rulerMode = !!active;
+    rulerModeBtn.classList.toggle('active', rulerMode);
+    rulerModeBtn.setAttribute('aria-pressed', rulerMode ? 'true' : 'false');
+    rulerModeIndicatorEl.classList.toggle('active', rulerMode);
+    canvas.style.cursor = rulerMode ? 'crosshair' : '';
+    focusStage();
+  }
+  function updateRulerButtons() {
+    clearRulerBtn.disabled = !ruler;
+    rulerModeBtn.classList.toggle('active', rulerMode);
+  }
+  function setRulerStatus() {
+    if (!ruler) {
+      setStatus(rulerMode ? 'Ruler: click the start point on an image.' : 'Ruler cleared');
+      return;
+    }
+    if (!ruler.complete) {
+      setStatus('Ruler: click the end point.');
+      return;
+    }
+    const a = rulerPointToPreview(ruler.start);
+    const b = rulerPointToPreview(ruler.end);
+    setStatus(`Ruler: ${formatRulerMeters(a && b ? rulerMeters(a, b) : NaN)}`);
+  }
+  function drawRulerOverlay() {
+    if (!overlayCtx || !ruler || !ruler.start) return;
+    const a = rulerPointToPreview(ruler.start);
+    const b = rulerPointToPreview(ruler.end);
+    if (!a || !b) return;
+    const as = previewToScreen(a);
+    const bs = previewToScreen(b);
+    const meters = rulerMeters(a, b);
+    overlayCtx.save();
+    overlayCtx.lineCap = 'round';
+    overlayCtx.lineJoin = 'round';
+    overlayCtx.strokeStyle = 'rgba(255,255,255,.96)';
+    overlayCtx.lineWidth = 7;
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(as[0], as[1]);
+    overlayCtx.lineTo(bs[0], bs[1]);
+    overlayCtx.stroke();
+    overlayCtx.strokeStyle = '#f9ab00';
+    overlayCtx.lineWidth = 3;
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(as[0], as[1]);
+    overlayCtx.lineTo(bs[0], bs[1]);
+    overlayCtx.stroke();
+    for (const pt of [as, bs]) {
+      overlayCtx.beginPath();
+      overlayCtx.arc(pt[0], pt[1], 6, 0, Math.PI * 2);
+      overlayCtx.fillStyle = 'rgba(255,255,255,.98)';
+      overlayCtx.fill();
+      overlayCtx.strokeStyle = '#b06000';
+      overlayCtx.lineWidth = 2;
+      overlayCtx.stroke();
+    }
+    const mid = [(as[0] + bs[0]) / 2, (as[1] + bs[1]) / 2];
+    const dx = bs[0] - as[0];
+    const dy = bs[1] - as[1];
+    const len = Math.max(1, Math.hypot(dx, dy));
+    const nx = -dy / len;
+    const ny = dx / len;
+    const label = formatRulerMeters(meters);
+    overlayCtx.font = '13px system-ui, -apple-system, Segoe UI, sans-serif';
+    overlayCtx.textAlign = 'center';
+    overlayCtx.textBaseline = 'middle';
+    const labelX = mid[0] + nx * 18;
+    const labelY = mid[1] + ny * 18;
+    const metrics = overlayCtx.measureText(label);
+    overlayCtx.fillStyle = 'rgba(255,255,255,.92)';
+    overlayCtx.fillRect(labelX - metrics.width / 2 - 6, labelY - 11, metrics.width + 12, 22);
+    overlayCtx.fillStyle = '#5f3700';
+    overlayCtx.fillText(label, labelX, labelY);
+    overlayCtx.restore();
+  }
   function hideTooltip() {
     tooltip.style.display = 'none';
+    tooltip.classList.remove('message');
   }
   function escapeHtml(value) {
     return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[ch]));
@@ -2859,8 +3238,7 @@ WEBUI_JS = r"""(() => {
     if (!Number.isFinite(gb)) return 'unknown';
     return `${Math.max(0.1, gb).toFixed(1)} GB`;
   }
-  function showTooltip(ev, text) {
-    tooltip.textContent = text;
+  function positionTooltip(ev) {
     tooltip.style.display = 'block';
     const pad = 12;
     const stageRect = canvas.getBoundingClientRect();
@@ -2872,6 +3250,25 @@ WEBUI_JS = r"""(() => {
     y = Math.max(stageRect.top + pad, Math.min(stageRect.bottom - tooltip.offsetHeight - pad, y));
     tooltip.style.left = `${x}px`;
     tooltip.style.top = `${y}px`;
+  }
+  function showTooltip(ev, text) {
+    tooltip.textContent = text;
+    tooltip.classList.add('message');
+    positionTooltip(ev);
+  }
+  function showPhotoTooltip(ev, photo) {
+    const frag = document.createDocumentFragment();
+    const lines = tooltipLines(photo);
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = document.createElement('span');
+      line.textContent = lines[i].text;
+      if (lines[i].altitude && photo.altitude_shift_alert) line.className = 'altitude-alert';
+      frag.appendChild(line);
+      if (i + 1 < lines.length) frag.appendChild(document.createTextNode('\n'));
+    }
+    tooltip.replaceChildren(frag);
+    tooltip.classList.remove('message');
+    positionTooltip(ev);
   }
   function chooseOpacitySaveMode(opacity) {
     return new Promise(resolve => {
@@ -2939,6 +3336,35 @@ WEBUI_JS = r"""(() => {
       window.addEventListener('keydown', onKey);
       opacityDialogSave.focus();
     });
+  }
+  function showSaveFailureDialog(error) {
+    const message = String(error || 'unknown error');
+    if (shownSaveError === message) return;
+    shownSaveError = message;
+    opacityDialogTitle.textContent = 'Save failed';
+    opacityDialogMessage.textContent = message;
+    opacityDialogSave.textContent = 'OK';
+    opacityDialogSaveOpaque.style.display = 'none';
+    opacityDialogCancel.style.display = 'none';
+    modalBackdrop.classList.add('active');
+    function cleanup() {
+      modalBackdrop.classList.remove('active');
+      opacityDialogSaveOpaque.style.display = '';
+      opacityDialogCancel.style.display = '';
+      opacityDialogSave.removeEventListener('click', cleanup);
+      modalBackdrop.removeEventListener('click', onBackdrop);
+      window.removeEventListener('keydown', onKey);
+    }
+    function onBackdrop(ev) {
+      if (ev.target === modalBackdrop) cleanup();
+    }
+    function onKey(ev) {
+      if (ev.key === 'Escape' || ev.key === 'Enter') cleanup();
+    }
+    opacityDialogSave.addEventListener('click', cleanup);
+    modalBackdrop.addEventListener('click', onBackdrop);
+    window.addEventListener('keydown', onKey);
+    opacityDialogSave.focus();
   }
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -3241,16 +3667,22 @@ WEBUI_JS = r"""(() => {
     overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
     drawMapAttribution(overlayCtx);
     drawLayerOutlines(overlayCtx);
-    if (!state || !captureOrderEnabled()) return;
+    if (!state || !captureOrderEnabled()) {
+      drawRulerOverlay();
+      return;
+    }
     const seq = Array.isArray(state.sequence) ? state.sequence : [];
     const pts = seq.map(item => ({ ...item, screen: previewToScreen([item.center[0], item.center[1]]) }));
     overlayCtx.save();
-    overlayCtx.lineWidth = 5;
     overlayCtx.lineCap = 'round';
     overlayCtx.lineJoin = 'round';
-    overlayCtx.strokeStyle = '#1a73e8';
-    overlayCtx.fillStyle = '#1a73e8';
-    for (let i = 0; i < pts.length - 1; i += 1) drawArrow(overlayCtx, pts[i].screen, pts[i + 1].screen);
+    for (let i = 0; i < pts.length - 1; i += 1) {
+      const isAltitudeTransition = !!pts[i + 1].altitude_shift_from_previous;
+      overlayCtx.lineWidth = isAltitudeTransition ? 8 : 5;
+      overlayCtx.strokeStyle = isAltitudeTransition ? '#d93025' : '#1a73e8';
+      overlayCtx.fillStyle = isAltitudeTransition ? '#d93025' : '#1a73e8';
+      drawArrow(overlayCtx, pts[i].screen, pts[i + 1].screen);
+    }
     overlayCtx.font = '12px system-ui, -apple-system, Segoe UI, sans-serif';
     overlayCtx.textAlign = 'center';
     overlayCtx.textBaseline = 'top';
@@ -3270,6 +3702,23 @@ WEBUI_JS = r"""(() => {
       }
     }
     overlayCtx.restore();
+    drawRulerOverlay();
+  }
+  function altitudeShiftArrowHitAtClient(clientX, clientY) {
+    if (!state || !captureOrderEnabled() || !Array.isArray(state.sequence)) return false;
+    const rect = canvas.getBoundingClientRect();
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return false;
+    const p = [
+      (clientX - rect.left) * (canvas.width / rect.width),
+      (clientY - rect.top) * (canvas.height / rect.height),
+    ];
+    const pts = state.sequence.map(item => ({ ...item, screen: previewToScreen([item.center[0], item.center[1]]) }));
+    for (let i = 0; i < pts.length - 1; i += 1) {
+      if (pts[i + 1].altitude_shift_from_previous && screenDistanceToSegment(p, pts[i].screen, pts[i + 1].screen) <= 10) {
+        return true;
+      }
+    }
+    return false;
   }
   function photoLayerOpacity() {
     return Math.max(0, Math.min(1, (Number(state.options.opacity_pct) || 100) / 100));
@@ -3496,7 +3945,17 @@ WEBUI_JS = r"""(() => {
     if (refit) fit();
     draw();
   }
+  let optionTimer = null;
+  let optionChangeGeneration = 0;
+  let optionUpdateInFlight = false;
+  let queuedOptionReloadTextures = false;
   async function updateOptions(reloadTextures = false) {
+    if (optionUpdateInFlight) {
+      queuedOptionReloadTextures = queuedOptionReloadTextures || reloadTextures;
+      return;
+    }
+    optionUpdateInFlight = true;
+    const requestGeneration = optionChangeGeneration;
     opacityTextEl.textContent = `${opacityEl.value}%`;
     const payload = {
       alt_correction_m: parseFloat(altEl.value || '0'),
@@ -3507,18 +3966,33 @@ WEBUI_JS = r"""(() => {
       crop_optimize: cropOptimizeEl.checked,
     };
     setStatus('Updating geometry...');
-    const res = await fetch('/api/options', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
-    state = await res.json();
-    syncControlsFromState();
-    if (reloadTextures || !updateLayerGeometry()) {
-      await rebuildLayers();
-    } else {
-      setStatus('Ready: geometry updated');
+    try {
+      const res = await fetch('/api/options', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+      const nextState = await res.json();
+      if (requestGeneration !== optionChangeGeneration) return;
+      state = nextState;
+      syncControlsFromState();
+      if (reloadTextures || !updateLayerGeometry()) {
+        await rebuildLayers();
+      } else {
+        setStatus('Ready: geometry updated');
+      }
+      draw();
+      scheduleAreaStats();
+    } finally {
+      optionUpdateInFlight = false;
+      if (requestGeneration !== optionChangeGeneration || queuedOptionReloadTextures) {
+        const queuedReloadTextures = queuedOptionReloadTextures;
+        queuedOptionReloadTextures = false;
+        clearTimeout(optionTimer);
+        optionTimer = null;
+        updateOptions(queuedReloadTextures).catch(err => setStatus(`Update failed: ${err}`));
+      }
     }
-    draw();
   }
-  let optionTimer = null;
   function scheduleOptions(reloadTextures = false) {
+    optionChangeGeneration += 1;
+    invalidateAreaStats();
     clearTimeout(optionTimer);
     optionTimer = setTimeout(() => updateOptions(reloadTextures), 160);
   }
@@ -3537,6 +4011,9 @@ WEBUI_JS = r"""(() => {
     const currentText = `${altEl.value}|${yawEl.value}`;
     if (currentText === lastCommittedNumberText) return Promise.resolve();
     lastCommittedNumberText = currentText;
+    optionChangeGeneration += 1;
+    invalidateAreaStats();
+    clearTimeout(optionTimer);
     return updateOptions(false);
   }
   function onNumberEditKeydown(ev) {
@@ -3558,6 +4035,8 @@ WEBUI_JS = r"""(() => {
   function showTab(name) {
     tabButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.tab === name));
     tabPanels.forEach(panel => panel.classList.toggle('active', panel.dataset.panel === name));
+    if (name === 'area') scheduleAreaStats();
+    else invalidateAreaStats();
     resize();
   }
   function isTypingTarget(target) {
@@ -3609,19 +4088,35 @@ WEBUI_JS = r"""(() => {
   basemapProviderEls.forEach(el => el.addEventListener('change', draw));
   tabButtons.forEach(btn => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
   document.getElementById('fit').addEventListener('click', fit);
+  rulerModeBtn.addEventListener('click', () => {
+    setRulerMode(!rulerMode);
+    if (rulerMode) setRulerStatus();
+  });
+  clearRulerBtn.addEventListener('click', () => {
+    ruler = null;
+    rulerDrag = null;
+    updateRulerButtons();
+    setRulerStatus();
+    draw();
+    focusStage();
+  });
   document.getElementById('revert').addEventListener('click', async () => {
     setStatus('Reverting...');
     const res = await fetch('/api/revert', { method: 'POST' });
     state = await res.json();
     syncControlsFromState();
     await rebuildLayers();
+    scheduleAreaStats();
     fit();
     draw();
     setStatus('Reverted to original');
   });
   function renderSaveStatus(payload) {
     if (!payload || !payload.active) {
-      if (payload && payload.error) setStatus(`Save failed: ${payload.error}`);
+      if (payload && payload.error) {
+        setStatus(`Save failed: ${payload.error}`);
+        showSaveFailureDialog(payload.error);
+      }
       setSaveActive(false);
       return false;
     }
@@ -3648,7 +4143,9 @@ WEBUI_JS = r"""(() => {
       return false;
     }
     setSaveActive(false);
-    setStatus(`Save failed: ${payload.error || 'unknown error'}`);
+    const error = payload.error || 'unknown error';
+    setStatus(`Save failed: ${error}`);
+    showSaveFailureDialog(error);
     return false;
   }
   async function pollSaveStatus() {
@@ -3671,6 +4168,7 @@ WEBUI_JS = r"""(() => {
   }
   document.getElementById('save').addEventListener('click', async () => {
     let forceSave = false;
+    shownSaveError = null;
     await updateMemoryInfo();
     const requiredBytes = Number(state && state.full_canvas ? state.full_canvas.estimated_memory_bytes : NaN);
     const marginBytes = Number(state && state.full_canvas ? state.full_canvas.memory_safety_margin_bytes : 0);
@@ -3729,10 +4227,106 @@ WEBUI_JS = r"""(() => {
     pan[1] += y / oldZoom - y / zoom;
     draw();
   }, { passive: false });
-  canvas.addEventListener('mousedown', ev => { dragging = true; lastMouse = [ev.clientX, ev.clientY]; });
-  window.addEventListener('mouseup', () => { dragging = false; });
+  canvas.addEventListener('mousedown', ev => {
+    mouseDragged = false;
+    mouseDownPos = [ev.clientX, ev.clientY];
+    if (rulerMode) {
+      hideTooltip();
+      const hit = rulerHitAtClient(ev.clientX, ev.clientY);
+      if (hit && ruler && ruler.complete) {
+        const p = clientToPreview(ev.clientX, ev.clientY);
+        rulerDrag = {
+          kind: hit.kind,
+          origin: [p.px, p.py],
+          startPreview: rulerPointToPreview(ruler.start),
+          endPreview: rulerPointToPreview(ruler.end),
+          startPhotoId: ruler.start && ruler.start.photoId,
+          endPhotoId: ruler.end && ruler.end.photoId,
+        };
+        rulerSuppressClick = false;
+        dragging = false;
+      } else {
+        dragging = true;
+        lastMouse = [ev.clientX, ev.clientY];
+        canvas.style.cursor = 'grabbing';
+      }
+      focusStage();
+      ev.preventDefault();
+      return;
+    }
+    dragging = true;
+    lastMouse = [ev.clientX, ev.clientY];
+  });
+  window.addEventListener('mouseup', ev => {
+    dragging = false;
+    if (rulerDrag) {
+      rulerDrag = null;
+      setRulerStatus();
+    }
+    if (rulerMode) {
+      const hit = rulerHitAtClient(ev.clientX, ev.clientY);
+      canvas.style.cursor = hit ? (hit.kind === 'move' ? 'move' : 'grab') : 'crosshair';
+    }
+  });
+  canvas.addEventListener('click', ev => {
+    if (!rulerMode) return;
+    ev.preventDefault();
+    focusStage();
+    if (rulerSuppressClick) {
+      rulerSuppressClick = false;
+      return;
+    }
+    if (mouseDragged) return;
+    const p = clientToPreview(ev.clientX, ev.clientY);
+    if (!ruler) {
+      const point = previewToRulerPoint(p.px, p.py);
+      ruler = { start: point, end: point, complete: false };
+      updateRulerButtons();
+      setRulerStatus();
+      draw();
+    } else if (!ruler.complete) {
+      ruler.end = previewToRulerPoint(p.px, p.py, ruler.start && ruler.start.photoId);
+      ruler.complete = true;
+      updateRulerButtons();
+      setRulerStatus();
+      draw();
+    }
+  });
   window.addEventListener('mousemove', ev => {
+    if (rulerDrag && ruler && ruler.complete) {
+      hideTooltip();
+      if (mouseDownPos && Math.hypot(ev.clientX - mouseDownPos[0], ev.clientY - mouseDownPos[1]) > 4) {
+        mouseDragged = true;
+        rulerSuppressClick = true;
+      }
+      const p = clientToPreview(ev.clientX, ev.clientY);
+      const dx = p.px - rulerDrag.origin[0];
+      const dy = p.py - rulerDrag.origin[1];
+      if (rulerDrag.kind === 'start' || rulerDrag.kind === 'move') {
+        ruler.start = previewToRulerPoint(
+          rulerDrag.startPreview[0] + dx,
+          rulerDrag.startPreview[1] + dy,
+          rulerDrag.startPhotoId
+        );
+      }
+      if (rulerDrag.kind === 'end' || rulerDrag.kind === 'move') {
+        ruler.end = previewToRulerPoint(
+          rulerDrag.endPreview[0] + dx,
+          rulerDrag.endPreview[1] + dy,
+          rulerDrag.endPhotoId
+        );
+      }
+      setRulerStatus();
+      draw();
+      return;
+    }
     if (!dragging) {
+      if (rulerMode) {
+        hideTooltip();
+        const hit = rulerHitAtClient(ev.clientX, ev.clientY);
+        canvas.style.cursor = hit ? (hit.kind === 'move' ? 'move' : 'grab') : 'crosshair';
+        return;
+      }
       if (!state || !state.photos) {
         hideTooltip();
         return;
@@ -3765,10 +4359,19 @@ WEBUI_JS = r"""(() => {
       } else if (compareMode() === 'pair-swipe') {
         draw();
       }
-      if (found) showTooltip(ev, tooltipText(found)); else hideTooltip();
+      if (altitudeShiftArrowHitAtClient(ev.clientX, ev.clientY)) {
+        showTooltip(ev, altitudeShiftArrowWarningText);
+      } else if (found) {
+        showPhotoTooltip(ev, found);
+      } else {
+        hideTooltip();
+      }
       return;
     }
     hideTooltip();
+    if (mouseDownPos && Math.hypot(ev.clientX - mouseDownPos[0], ev.clientY - mouseDownPos[1]) > 4) {
+      mouseDragged = true;
+    }
     if (hoverPhotoId !== null || hoverUnderPhotoId !== null) {
       hoverPhotoId = null;
       hoverUnderPhotoId = null;
@@ -3787,12 +4390,14 @@ WEBUI_JS = r"""(() => {
   window.addEventListener('beforeunload', notifyServerShutdown);
   canvas.addEventListener('mouseleave', () => {
     hideTooltip();
+    if (rulerMode && !rulerDrag) canvas.style.cursor = 'crosshair';
     if (hoverPhotoId !== null || hoverUnderPhotoId !== null) {
       hoverPhotoId = null;
       hoverUnderPhotoId = null;
       if (pairModeActive(compareMode())) draw();
     }
   });
+  updateRulerButtons();
   resize();
   setMemoryPolling(5000);
   updateMemoryInfo();
@@ -3883,11 +4488,42 @@ def _first_text_or_na(values: List[Optional[str]]) -> str:
     return "N/A"
 
 
+def _abs_rel_alt_difference_m(meta: PhotoMeta) -> Optional[float]:
+    absolute_alt = getattr(meta, "absolute_alt_m", None)
+    if absolute_alt is None:
+        return None
+    return float(absolute_alt) - float(meta.alt_m)
+
+
+def _altitude_shift_boundary_indices(ordered_sequence: List[Tuple[int, PhotoMeta]]) -> List[int]:
+    boundary_indices: List[int] = []
+    previous_difference: Optional[float] = None
+    for sequence_index, (_, meta) in enumerate(ordered_sequence):
+        difference = _abs_rel_alt_difference_m(meta)
+        if difference is None:
+            previous_difference = None
+            continue
+        if (
+            previous_difference is not None
+            and abs(difference - previous_difference) >= (ABS_REL_ALT_CHANGE_THRESHOLD_M - 1e-9)
+        ):
+            boundary_indices.append(sequence_index)
+        previous_difference = difference
+    return boundary_indices
+
+
 def _build_ui_info(metas: List[PhotoMeta], options: RenderOptions) -> Dict[str, List[str]]:
     if not metas:
         return {
             "camera_water_lines": ["Avg. Camera-Water Distance: 0.00 m"],
-            "relative_altitude_lines": ["Avg: 0.00 m", "Min: 0.00 m", "Max: 0.00 m"],
+            "relative_altitude_lines": [
+                "Relative Avg: 0.00 m",
+                "Relative Min: 0.00 m",
+                "Relative Max: 0.00 m",
+                "Absolute Avg: N/A",
+                "Absolute Min: N/A",
+                "Absolute Max: N/A",
+            ],
             "yaw_description_lines": [
                 "Flight Yaw Degree = Drone direction (Exif)",
                 "Gimbal Yaw Degree = Gimbal direction (Exif)",
@@ -3901,6 +4537,15 @@ def _build_ui_info(metas: List[PhotoMeta], options: RenderOptions) -> Dict[str, 
     rel_min = float(np.min(rel_vals))
     rel_max = float(np.max(rel_vals))
     cam_water_avg = rel_avg + float(getattr(options, "alt_correction_m", 0.0))
+    abs_vals = [float(m.absolute_alt_m) for m in metas if getattr(m, "absolute_alt_m", None) is not None]
+    if abs_vals:
+        absolute_altitude_lines = [
+            f"Absolute Avg: {float(np.mean(abs_vals)):.2f} m",
+            f"Absolute Min: {float(np.min(abs_vals)):.2f} m",
+            f"Absolute Max: {float(np.max(abs_vals)):.2f} m",
+        ]
+    else:
+        absolute_altitude_lines = ["Absolute Avg: N/A", "Absolute Min: N/A", "Absolute Max: N/A"]
 
     fov_vals = [float(m.hfov_deg) for m in metas]
     fov_avg = float(np.mean(fov_vals))
@@ -3914,10 +4559,10 @@ def _build_ui_info(metas: List[PhotoMeta], options: RenderOptions) -> Dict[str, 
     return {
         "camera_water_lines": [f"Avg. Camera-Water Distance: {cam_water_avg:.2f} m"],
         "relative_altitude_lines": [
-            f"Avg: {rel_avg:.2f} m",
-            f"Min: {rel_min:.2f} m",
-            f"Max: {rel_max:.2f} m",
-        ],
+            f"Relative Avg: {rel_avg:.2f} m",
+            f"Relative Min: {rel_min:.2f} m",
+            f"Relative Max: {rel_max:.2f} m",
+        ] + absolute_altitude_lines,
         "yaw_description_lines": [
             "Flight Yaw Degree = Drone direction (Exif)",
             "Gimbal Yaw Degree = Gimbal direction (Exif)",
@@ -3934,11 +4579,47 @@ def _build_ui_info(metas: List[PhotoMeta], options: RenderOptions) -> Dict[str, 
             fov_line,
             "Flight Pitch [deg]: " + _stats_line([getattr(m, "flight_pitch_deg", None) for m in metas]),
             "Gimbal Pitch [deg]: " + _stats_line([getattr(m, "gimbal_pitch_deg", None) for m in metas]),
-            "Gimbal Roll [deg]: " + _stats_line([getattr(m, "gimbal_roll_deg", None) for m in metas]),
-            "Flight Roll [deg]: " + _stats_line([getattr(m, "flight_roll_deg", None) for m in metas]),
+            "Gimbal Roll [degree]: " + _stats_line([getattr(m, "gimbal_roll_deg", None) for m in metas]),
+            "Flight Roll [degree]: " + _stats_line([getattr(m, "flight_roll_deg", None) for m in metas]),
             "Flight Yaw [deg]: " + _stats_line([getattr(m, "flight_yaw_deg", None) for m in metas]),
             "Gimbal Yaw [deg]: " + _stats_line([getattr(m, "gimbal_yaw_deg", None) for m in metas]),
+            "Flight X Speed [m/s]: " + _stats_line([getattr(m, "flight_x_speed_mps", None) for m in metas]),
+            "Flight Y Speed [m/s]: " + _stats_line([getattr(m, "flight_y_speed_mps", None) for m in metas]),
+            "Flight Z Speed [m/s]: " + _stats_line([getattr(m, "flight_z_speed_mps", None) for m in metas]),
         ],
+    }
+
+
+def _build_area_stats(
+    polygons_full_px: List[List[Tuple[float, float]]],
+    canvas_w: int,
+    canvas_h: int,
+    mpp: float,
+) -> Dict[str, object]:
+    if not polygons_full_px or canvas_w <= 0 or canvas_h <= 0 or mpp <= 0:
+        return {"mosaic_area_m2": 0.0, "overlap_area_m2": 0.0, "overlap_pct": 0.0, "approximate": False}
+
+    mask_scale = min(1.0, AREA_MASK_MAX_DIM_PX / float(max(canvas_w, canvas_h)))
+    mask_w = max(1, int(math.ceil(canvas_w * mask_scale)))
+    mask_h = max(1, int(math.ceil(canvas_h * mask_scale)))
+    count_dtype = np.uint16 if len(polygons_full_px) <= np.iinfo(np.uint16).max else np.uint32
+    coverage = np.zeros((mask_h, mask_w), dtype=count_dtype)
+    mask = Image.new("1", (mask_w, mask_h), 0)
+    draw = ImageDraw.Draw(mask)
+    for polygon in polygons_full_px:
+        mask.paste(0, (0, 0, mask_w, mask_h))
+        draw.polygon([(x * mask_scale, y * mask_scale) for x, y in polygon], fill=1)
+        coverage += np.asarray(mask, dtype=count_dtype)
+
+    area_per_cell_m2 = (float(mpp) / mask_scale) ** 2
+    mosaic_area_m2 = float(np.count_nonzero(coverage >= 1)) * area_per_cell_m2
+    overlap_area_m2 = float(np.count_nonzero(coverage >= 2)) * area_per_cell_m2
+    overlap_pct = 0.0 if mosaic_area_m2 <= 0 else (overlap_area_m2 / mosaic_area_m2) * 100.0
+    return {
+        "mosaic_area_m2": mosaic_area_m2,
+        "overlap_area_m2": overlap_area_m2,
+        "overlap_pct": overlap_pct,
+        "approximate": mask_scale < 1.0,
     }
 
 
@@ -4069,6 +4750,17 @@ class WebMosaicSession:
         m_per_deg_lat, m_per_deg_lon = _meters_per_deg(origin_lat)
         photos: List[Dict[str, object]] = []
         sequence: List[Dict[str, object]] = []
+        ordered_sequence = sorted(
+            enumerate(self.metas),
+            key=lambda item: ((getattr(item[1], "captured_at", None) or ""), os.path.basename(item[1].path), item[0]),
+        )
+        altitude_shift_boundaries = _altitude_shift_boundary_indices(ordered_sequence)
+        first_altitude_shift_boundary = altitude_shift_boundaries[0] if altitude_shift_boundaries else None
+        altitude_shift_ids = (
+            {idx for idx, _ in ordered_sequence[first_altitude_shift_boundary:]}
+            if first_altitude_shift_boundary is not None
+            else set()
+        )
         ordered = sorted(enumerate(self.metas), key=lambda item: _effective_alt_m(item[1], self.options), reverse=True)
         for idx, meta in ordered:
             corners_world = _project_corners(meta, origin_lat, origin_lon, self.options)
@@ -4089,18 +4781,20 @@ class WebMosaicSession:
                     "width": meta.w,
                     "height": meta.h,
                     "alt_m": meta.alt_m,
+                    "absolute_alt_m": meta.absolute_alt_m,
                     "yaw_deg": meta.yaw_deg,
                     "flight_pitch_deg": meta.flight_pitch_deg,
                     "gimbal_pitch_deg": meta.gimbal_pitch_deg,
+                    "flight_roll_deg": meta.flight_roll_deg,
                     "flight_yaw_deg": meta.flight_yaw_deg,
                     "gimbal_yaw_deg": meta.gimbal_yaw_deg,
+                    "flight_x_speed_mps": meta.flight_x_speed_mps,
+                    "flight_y_speed_mps": meta.flight_y_speed_mps,
+                    "flight_z_speed_mps": meta.flight_z_speed_mps,
+                    "altitude_shift_alert": idx in altitude_shift_ids,
                 }
             )
-        ordered_sequence = sorted(
-            enumerate(self.metas),
-            key=lambda item: ((getattr(item[1], "captured_at", None) or ""), os.path.basename(item[1].path), item[0]),
-        )
-        for order, (idx, meta) in enumerate(ordered_sequence, start=1):
+        for sequence_index, (idx, meta) in enumerate(ordered_sequence):
             corners_world = _project_corners(meta, origin_lat, origin_lon, self.options)
             center_world = np.mean(corners_world, axis=0)
             center_u, center_v = _world_to_canvas(
@@ -4113,10 +4807,11 @@ class WebMosaicSession:
             sequence.append(
                 {
                     "id": idx,
-                    "order": order,
+                    "order": sequence_index + 1,
                     "name": os.path.basename(meta.path),
                     "captured_at": getattr(meta, "captured_at", None) or os.path.basename(meta.path),
                     "center": [float(center_u[0]) * scale, float(center_v[0]) * scale],
+                    "altitude_shift_from_previous": sequence_index in altitude_shift_boundaries,
                 }
             )
         return {
@@ -4151,6 +4846,28 @@ class WebMosaicSession:
             "sequence": sequence,
             "warnings": ["WebUI preview does not apply undistortion yet."] if self.options.undistort else [],
         }
+
+    def area_stats(self) -> Dict[str, object]:
+        with self.lock:
+            if not self.metas:
+                self._reload_metas()
+            metas = list(self.metas)
+            options = self.options
+        origin_lat, origin_lon, min_x, min_y, max_x, max_y, mpp = _compute_canvas(metas, options)
+        canvas_w = int(math.ceil((max_x - min_x) / mpp))
+        canvas_h = int(math.ceil((max_y - min_y) / mpp))
+        polygons_full_px: List[List[Tuple[float, float]]] = []
+        for meta in metas:
+            corners_world = _project_corners(meta, origin_lat, origin_lon, options)
+            u, v = _world_to_canvas(
+                corners_world[:, 0],
+                corners_world[:, 1],
+                min_x=min_x,
+                max_y=max_y,
+                mpp=mpp,
+            )
+            polygons_full_px.append([(float(u[i]), float(v[i])) for i in range(4)])
+        return _build_area_stats(polygons_full_px, canvas_w, canvas_h, mpp)
 
     def image_response(self, image_id: int) -> Tuple[bytes, str]:
         if image_id < 0 or image_id >= len(self.image_paths):
@@ -4330,6 +5047,9 @@ def _make_webui_handler(session: WebMosaicSession, debug: bool = False):
             if parsed.path == "/api/state":
                 with session.lock:
                     self._json(session.state())
+                return
+            if parsed.path == "/api/area-stats":
+                self._json(session.area_stats())
                 return
             if parsed.path == "/api/save-status":
                 self._json(session.save_status())
@@ -4820,6 +5540,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
                 lat_deg=meta.lat_deg,
                 lon_deg=meta.lon_deg,
                 alt_m=meta.alt_m,
+                absolute_alt_m=meta.absolute_alt_m,
                 yaw_deg=meta.yaw_deg,
                 hfov_deg=meta.hfov_deg,
                 pitch_deg=meta.pitch_deg,
@@ -4829,6 +5550,9 @@ class MosaicGUI(QtWidgets.QMainWindow):
                 gimbal_pitch_deg=meta.gimbal_pitch_deg,
                 gimbal_roll_deg=meta.gimbal_roll_deg,
                 flight_roll_deg=meta.flight_roll_deg,
+                flight_x_speed_mps=meta.flight_x_speed_mps,
+                flight_y_speed_mps=meta.flight_y_speed_mps,
+                flight_z_speed_mps=meta.flight_z_speed_mps,
                 product_name=meta.product_name,
                 unique_camera_model=meta.unique_camera_model,
                 captured_at=meta.captured_at,
