@@ -94,6 +94,7 @@ MAX_JPG_TIF_DIM_PX = 64000
 MEMORY_SAFETY_MARGIN_BYTES = 512 * 1024 * 1024
 ABS_REL_ALT_CHANGE_THRESHOLD_M = 0.15
 AREA_MASK_MAX_DIM_PX = 4096
+AREA_ERROR_SAFETY_FACTOR = 1.5
 
 # Metadata keys we expect to use (as seen by exifread)
 INSPECT_KEYS: Dict[str, Tuple[str, ...]] = {
@@ -2947,9 +2948,9 @@ WEBUI_JS = r"""(() => {
   function showAreaStats(area) {
     const areaPrefix = area.approximate ? 'Approx. ' : '';
     setLines(areaInfoEl, [
-      `${areaPrefix}Mosaic Image Area: ${formatArea(area.mosaic_area_m2)}`,
-      `${areaPrefix}Overlapping Area: ${formatArea(area.overlap_area_m2)}`,
-      `${areaPrefix}Overlap Ratio: ${fmtNum(area.overlap_pct)} %`,
+      `${areaPrefix}Mosaic Image Area: ${formatAreaWithError(area.mosaic_area_m2, area.area_error_m2)}`,
+      `${areaPrefix}Overlapping Area: ${formatAreaWithError(area.overlap_area_m2, area.area_error_m2)}`,
+      `${areaPrefix}Overlap Ratio: ${formatPercentWithError(area.overlap_pct, area.overlap_pct_error)}`,
     ]);
   }
   function isAreaTabActive() {
@@ -2994,6 +2995,18 @@ WEBUI_JS = r"""(() => {
     if (!Number.isFinite(area)) return 'N/A';
     if (area >= 1000000) return `${(area / 1000000).toFixed(3)} km\u00b2`;
     return `${area.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} m\u00b2`;
+  }
+  function formatAreaWithError(value, error) {
+    const label = formatArea(value);
+    const err = Number(error);
+    if (!Number.isFinite(err)) return label;
+    return `${label} +/- ${formatArea(err)}`;
+  }
+  function formatPercentWithError(value, error) {
+    const pct = fmtNum(value);
+    const err = Number(error);
+    if (!Number.isFinite(err)) return `${pct} %`;
+    return `${pct} % +/- ${fmtNum(err)} %`;
   }
   function fmtSpeed(value) {
     return value !== null && value !== undefined && Number.isFinite(Number(value)) ? Number(value).toFixed(1) : 'N/A';
@@ -4597,7 +4610,14 @@ def _build_area_stats(
     mpp: float,
 ) -> Dict[str, object]:
     if not polygons_full_px or canvas_w <= 0 or canvas_h <= 0 or mpp <= 0:
-        return {"mosaic_area_m2": 0.0, "overlap_area_m2": 0.0, "overlap_pct": 0.0, "approximate": False}
+        return {
+            "mosaic_area_m2": 0.0,
+            "overlap_area_m2": 0.0,
+            "overlap_pct": 0.0,
+            "area_error_m2": 0.0,
+            "overlap_pct_error": 0.0,
+            "approximate": False,
+        }
 
     mask_scale = min(1.0, AREA_MASK_MAX_DIM_PX / float(max(canvas_w, canvas_h)))
     mask_w = max(1, int(math.ceil(canvas_w * mask_scale)))
@@ -4615,10 +4635,27 @@ def _build_area_stats(
     mosaic_area_m2 = float(np.count_nonzero(coverage >= 1)) * area_per_cell_m2
     overlap_area_m2 = float(np.count_nonzero(coverage >= 2)) * area_per_cell_m2
     overlap_pct = 0.0 if mosaic_area_m2 <= 0 else (overlap_area_m2 / mosaic_area_m2) * 100.0
+    cell_size_m = float(mpp) / mask_scale
+    perimeter_px = 0.0
+    for polygon in polygons_full_px:
+        for i, p0 in enumerate(polygon):
+            p1 = polygon[(i + 1) % len(polygon)]
+            perimeter_px += math.hypot(float(p1[0]) - float(p0[0]), float(p1[1]) - float(p0[1]))
+    area_error_m2 = perimeter_px * float(mpp) * cell_size_m * AREA_ERROR_SAFETY_FACTOR
+    if mosaic_area_m2 > 0:
+        overlap_pct_error = 100.0 * (
+            (area_error_m2 / mosaic_area_m2)
+            + ((overlap_area_m2 * area_error_m2) / (mosaic_area_m2 * mosaic_area_m2))
+        )
+        overlap_pct_error = min(100.0, overlap_pct_error)
+    else:
+        overlap_pct_error = 0.0
     return {
         "mosaic_area_m2": mosaic_area_m2,
         "overlap_area_m2": overlap_area_m2,
         "overlap_pct": overlap_pct,
+        "area_error_m2": area_error_m2,
+        "overlap_pct_error": overlap_pct_error,
         "approximate": mask_scale < 1.0,
     }
 
