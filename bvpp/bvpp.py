@@ -2717,6 +2717,102 @@ WEBUI_HTML = """<!doctype html>
 
 
 WEBUI_JS = r"""(() => {
+  const preferredLang = (Array.isArray(navigator.languages) && navigator.languages.length ? navigator.languages[0] : navigator.language) || 'en';
+  const uiLang = String(preferredLang).toLowerCase().startsWith('ja') ? 'ja' : 'en';
+  const I18N = {
+    en: {
+      appTitle: 'bvpp WebUI', loading: 'Loading...', controlPanels: 'Control panels', imageAdjustment: 'Image Adjustment', miscControl: 'Misc. Control', save: 'Save', cancel: 'Cancel', exifInfo: 'Exif Info', area: 'Area',
+      cameraWaterDistance: 'Camera-Water Distance', altitudeCorrectionM: 'Altitude Correction [m]', rotationCorrection: 'Rotation Correction', degree: 'Degree', transparencyPct: 'Transparency (%)', opacity: 'Opacity',
+      overlapEffect: 'Overlap Effect', none: 'None', swipe: 'Swipe', redCyan: 'Red-Cyan', keyboardShortcuts: 'Keyboard Shortcuts', adjustmentControls: 'Adjustment Controls',
+      fitToView: 'Fit to View', editRuler: 'Edit Ruler', clearRuler: 'Clear Ruler', resetAdjustments: 'Reset Adjustments', saveOptions: 'Save Options', cropOptimize: 'Crop Optimize',
+      cropOptimizeHelp: 'When checked, mosaic saving uses the center area of each image as much as possible. This helps reduce blur near the edges of photos.', actions: 'Actions', backgroundMap: 'Background Map',
+      showBackgroundMap: 'Show Background Map', osmMap: 'OpenStreetMap (Map)', gsiPhoto: '日本国土地理院 (Photo)', captureOrder: 'Capture Order', showCaptureOrder: 'Show Capture Order',
+      captureOrderHelp: 'Shows blue center markers, arrows from earlier to later captures, and capture time labels.', imageRotationRule: 'Image Rotation Rule', yawBoth: 'Use Flight + Gimbal Yaw Degree',
+      yawFlightOnly: 'Use Flight Yaw Degree', yawGimbalOnly: 'Use Gimbal Yaw Degree', reverseRotate: 'Reverse rotate', productLens: 'Product/Lens', altitude: 'Altitude', flightSpeed: 'Flight Speed', pitch: 'Pitch', roll: 'Roll', yaw: 'Yaw', mosaicArea: 'Mosaic Area',
+      saveWithTransparencyTitle: 'Save with transparency?', saveWithoutTransparency: 'Save without transparency', insufficientMemoryTitle: 'Insufficient memory may be', forceSave: 'Force Save', saveFailedTitle: 'Save failed', ok: 'OK', editRulerMode: 'EDIT RULER MODE',
+      altitudeShiftPanelWarning: 'The offset between Relative Altitude and the actual altitude appears to have changed during the flight. In this case, the required altitude correction is likely to differ by location. Check "Show Capture Order" to identify where the offset changed, split the images before and after each change into separate folders, and process them separately.',
+      altitudeShiftArrowWarning: 'The actual altitude appears to have diverged from Relative Altitude. We recommend moving this and subsequent images to a separate folder and processing them separately.', approxPrefix: 'Approx.', mosaicImageArea: 'Mosaic Image Area', overlappingArea: 'Overlapping Area', overlapRatio: 'Overlap Ratio',
+      waitingForAdjustment: 'Waiting for adjustment to stop...', calculating: 'Calculating...', areaCalculationFailed: 'Area calculation failed: {error}', rulerStart: 'Ruler: click the start point on an image.', rulerCleared: 'Ruler cleared', rulerEnd: 'Ruler: click the end point.', rulerValue: 'Ruler: {value}',
+      file: 'File', exif: 'Exif', relativeAltitudeM: 'Relative Altitude [m]', absoluteAltitudeM: 'Absolute Altitude [m]', absRelAltM: 'Abs - Rel Alt. [m]', flightPitchDegree: 'Flight Pitch [degree]', gimbalPitchDegree: 'Gimbal Pitch [degree]', flightRollDegreeLabel: 'Flight Roll [degree]', flightYawDegree: 'Flight Yaw Degree', gimbalYawDegree: 'Gimbal Yaw Degree', flightXYZSpeed: 'Flight X/Y/Z Speed', webglUnavailable: 'WebGL is not available in this browser.', loadedTextures: 'Loaded {loaded}/{total} textures', readyTextures: 'Ready: {loaded}/{total} textures', opacitySaveMessage: 'Opacity is currently {opacity}%. Choose how to save the mosaic.', memoryForceMessage: 'There may be about {shortage} less available memory than required for saving. A shortage of around 5 GB may still be possible to run, but anything beyond that depends on the situation. Do you want to continue?',
+      unknownError: 'unknown error', loadingTextures: 'Loading {count} textures...', photos: 'photos', preview: 'preview', saveSize: 'save', estimatedMemoryRequired: 'estimated memory required for saving', zoom: 'zoom', physicalMemory: 'physical memory', availableMemory: 'available memory',
+      updatingGeometry: 'Updating geometry...', readyGeometryUpdated: 'Ready: geometry updated', updateFailed: 'Update failed: {error}', reverting: 'Reverting...', reverted: 'Reverted to original', saving: 'Saving...', saveFailed: 'Save failed: {error}', saved: 'Saved: {path}', saveCancelled: 'Save cancelled', saveStatusFailed: 'Save status failed: {error}', startingSave: 'Starting full-resolution mosaic save...', saveStartFailed: 'Save start failed: {error}', cancellingSave: 'Cancelling save...',
+      preparing: 'Preparing', computingCanvas: 'Computing canvas', processing: 'Processing', savingPhase: 'Saving', done: 'Done', cancelled: 'Cancelled', error: 'Error', saveProgressElapsed: 'Saving... elapsed {elapsed}s, size {size}, speed {speed} MB/s',
+      avgCameraWaterDistance: 'Avg. Camera-Water Distance', relativeAvg: 'Relative Avg', relativeMin: 'Relative Min', relativeMax: 'Relative Max', absoluteAvg: 'Absolute Avg', absoluteMin: 'Absolute Min', absoluteMax: 'Absolute Max',
+      flightYawDegreeDesc: 'Flight Yaw Degree = Drone direction (Exif)', gimbalYawDegreeDesc: 'Gimbal Yaw Degree = Gimbal direction (Exif)', shortcutAltitudeUp: 'H: Altitude +0.2m', shortcutAltitudeDown: 'J: Altitude -0.2m', shortcutRotationUp: 'K: Rotation +2 deg', shortcutRotationDown: 'L: Rotation -2 deg', noExifStats: 'No EXIF stats available',
+      productName: 'Product Name', uniqueCameraModel: 'Unique Camera Model', uniform: 'uniform', mismatchDetected: 'mismatch detected', flightPitchDeg: 'Flight Pitch [deg]', gimbalPitchDeg: 'Gimbal Pitch [deg]', gimbalRollDegree: 'Gimbal Roll [degree]', flightRollDegree: 'Flight Roll [degree]', flightYawDeg: 'Flight Yaw [deg]', gimbalYawDeg: 'Gimbal Yaw [deg]', flightXSpeedMps: 'Flight X Speed [m/s]', flightYSpeedMps: 'Flight Y Speed [m/s]', flightZSpeedMps: 'Flight Z Speed [m/s]', sourceGsi: 'Source: 国土地理院 地理院タイル'
+    },
+    ja: {
+      appTitle: 'bvpp WebUI', loading: '読み込み中...', controlPanels: '操作パネル', imageAdjustment: '画像調整', miscControl: 'その他の操作', save: '保存', cancel: 'キャンセル', exifInfo: 'Exif情報', area: '面積',
+      cameraWaterDistance: 'カメラ-水面距離', altitudeCorrectionM: '高度補正 [m]', rotationCorrection: '回転補正', degree: '角度', transparencyPct: '透過率 (%)', opacity: '不透明度',
+      overlapEffect: '重なり表示効果', none: 'なし', swipe: 'スワイプ', redCyan: '赤-シアン', keyboardShortcuts: 'キーボードショートカット', adjustmentControls: '調整コントロール',
+      fitToView: '全体表示', editRuler: 'ルーラー編集', clearRuler: 'ルーラー消去', resetAdjustments: '調整をリセット', saveOptions: '保存オプション', cropOptimize: 'クロップ最適化',
+      cropOptimizeHelp: 'オンにすると、モザイク保存時に各画像の中央付近をできるだけ使います。写真の端付近のぼけを減らすのに役立ちます。', actions: '操作', backgroundMap: '背景地図',
+      showBackgroundMap: '背景地図を表示', osmMap: 'OpenStreetMap (地図)', gsiPhoto: '日本国土地理院 (写真)', captureOrder: '撮影順', showCaptureOrder: '撮影順を表示',
+      captureOrderHelp: '青い中心マーカー、撮影の前後を示す矢印、撮影時刻ラベルを表示します。', imageRotationRule: '画像回転ルール', yawBoth: '飛行Yaw角 + ジンバルYaw角を使用',
+      yawFlightOnly: '飛行Yaw角を使用', yawGimbalOnly: 'ジンバルYaw角を使用', reverseRotate: '逆回転', productLens: '製品/レンズ', altitude: '高度', flightSpeed: '飛行速度', pitch: 'ピッチ', roll: 'ロール', yaw: 'Yaw', mosaicArea: 'モザイク面積',
+      saveWithTransparencyTitle: '透過ありで保存しますか？', saveWithoutTransparency: '透過なしで保存', insufficientMemoryTitle: 'メモリが不足している可能性があります', forceSave: '強制保存', saveFailedTitle: '保存に失敗しました', ok: 'OK', editRulerMode: 'ルーラー編集モード',
+      altitudeShiftPanelWarning: 'Relative Altitude と実高度の差が飛行中に変化しているようです。この場合、必要な高度補正は場所によって異なる可能性があります。「撮影順を表示」でずれが変わった位置を確認し、変化の前後で画像を別フォルダに分けて、それぞれ処理してください。',
+      altitudeShiftArrowWarning: '実高度と Relative Altitude の差が変化したようです。この画像以降を別フォルダに移して、分けて処理することを推奨します。', approxPrefix: '概算', mosaicImageArea: 'モザイク画像面積', overlappingArea: '重複面積', overlapRatio: '重複率',
+      waitingForAdjustment: '調整が止まるのを待っています...', calculating: '計算中...', areaCalculationFailed: '面積計算に失敗しました: {error}', rulerStart: 'ルーラー: 画像上の開始点をクリックしてください。', rulerCleared: 'ルーラーを消去しました', rulerEnd: 'ルーラー: 終了点をクリックしてください。', rulerValue: 'ルーラー: {value}',
+      file: 'ファイル', exif: 'Exif', relativeAltitudeM: 'Relative Altitude [m]', absoluteAltitudeM: 'Absolute Altitude [m]', absRelAltM: 'Abs - Rel Alt. [m]', flightPitchDegree: '飛行ピッチ [degree]', gimbalPitchDegree: 'ジンバルピッチ [degree]', flightRollDegreeLabel: '飛行ロール [degree]', flightYawDegree: '飛行Yaw角', gimbalYawDegree: 'ジンバルYaw角', flightXYZSpeed: '飛行X/Y/Z速度', webglUnavailable: 'このブラウザでは WebGL を利用できません。', loadedTextures: '{loaded}/{total} 個のテクスチャを読み込みました', readyTextures: '準備完了: {loaded}/{total} 個のテクスチャ', opacitySaveMessage: '現在の不透明度は {opacity}% です。モザイクの保存方法を選択してください。', memoryForceMessage: '保存に必要な量に対して、利用可能メモリが約 {shortage} 不足している可能性があります。5 GB 程度の不足なら実行できる場合もありますが、状況に依存します。続行しますか？',
+      unknownError: '不明なエラー', loadingTextures: '{count} 個のテクスチャを読み込み中...', photos: '枚の写真', preview: 'プレビュー', saveSize: '保存', estimatedMemoryRequired: '保存に必要な推定メモリ', zoom: 'ズーム', physicalMemory: '物理メモリ', availableMemory: '利用可能メモリ',
+      updatingGeometry: 'ジオメトリを更新中...', readyGeometryUpdated: '準備完了: ジオメトリを更新しました', updateFailed: '更新に失敗しました: {error}', reverting: '戻しています...', reverted: '元の状態に戻しました', saving: '保存中...', saveFailed: '保存に失敗しました: {error}', saved: '保存しました: {path}', saveCancelled: '保存をキャンセルしました', saveStatusFailed: '保存状態の取得に失敗しました: {error}', startingSave: 'フル解像度モザイク保存を開始しています...', saveStartFailed: '保存開始に失敗しました: {error}', cancellingSave: '保存をキャンセル中...',
+      preparing: '準備中', computingCanvas: 'キャンバスを計算中', processing: '処理中', savingPhase: '保存中', done: '完了', cancelled: 'キャンセル済み', error: 'エラー', saveProgressElapsed: '保存中... 経過 {elapsed}s, サイズ {size}, 速度 {speed} MB/s',
+      avgCameraWaterDistance: '平均カメラ-水面距離', relativeAvg: 'Relative 平均', relativeMin: 'Relative 最小', relativeMax: 'Relative 最大', absoluteAvg: 'Absolute 平均', absoluteMin: 'Absolute 最小', absoluteMax: 'Absolute 最大',
+      flightYawDegreeDesc: 'Flight Yaw Degree = ドローンの向き (Exif)', gimbalYawDegreeDesc: 'Gimbal Yaw Degree = ジンバルの向き (Exif)', shortcutAltitudeUp: 'H: 高度 +0.2m', shortcutAltitudeDown: 'J: 高度 -0.2m', shortcutRotationUp: 'K: 回転 +2 deg', shortcutRotationDown: 'L: 回転 -2 deg', noExifStats: 'EXIF統計情報はありません',
+      productName: '製品名', uniqueCameraModel: '固有カメラモデル', uniform: '均一', mismatchDetected: '不一致を検出', flightPitchDeg: '飛行ピッチ [deg]', gimbalPitchDeg: 'ジンバルピッチ [deg]', gimbalRollDegree: 'ジンバルロール [degree]', flightRollDegree: '飛行ロール [degree]', flightYawDeg: '飛行Yaw [deg]', gimbalYawDeg: 'ジンバルYaw [deg]', flightXSpeedMps: '飛行X速度 [m/s]', flightYSpeedMps: '飛行Y速度 [m/s]', flightZSpeedMps: '飛行Z速度 [m/s]', sourceGsi: '出典: 国土地理院 地理院タイル'
+    }
+  };
+  function t(key, vars = {}) {
+    let text = (I18N[uiLang] && I18N[uiLang][key]) || key;
+    for (const [name, value] of Object.entries(vars)) text = text.replaceAll(`{${name}}`, String(value));
+    return text;
+  }
+  function translatePhase(phase) {
+    const phases = { Preparing: 'preparing', 'Computing canvas': 'computingCanvas', Processing: 'processing', Saving: 'savingPhase', Done: 'done', Cancelled: 'cancelled', Error: 'error' };
+    return t(phases[phase] || phase);
+  }
+  function translateSaveText(text) {
+    const m = String(text || '').match(/^Saving\.\.\. elapsed ([0-9.]+)s, size (.*), speed ([0-9.]+) MB\/s$/);
+    if (!m) return text || t('saving');
+    return t('saveProgressElapsed', { elapsed: m[1], size: m[2], speed: m[3] });
+  }
+  function translateInfoLine(line) {
+    if (uiLang !== 'ja') return line;
+    let text = String(line || '');
+    const exact = { 'Flight Yaw Degree = Drone direction (Exif)': t('flightYawDegreeDesc'), 'Gimbal Yaw Degree = Gimbal direction (Exif)': t('gimbalYawDegreeDesc'), 'H: Altitude +0.2m': t('shortcutAltitudeUp'), 'J: Altitude -0.2m': t('shortcutAltitudeDown'), 'K: Rotation +2 deg': t('shortcutRotationUp'), 'L: Rotation -2 deg': t('shortcutRotationDown'), 'No EXIF stats available': t('noExifStats') };
+    if (exact[text]) return exact[text];
+    const prefixMap = [['Avg. Camera-Water Distance', t('avgCameraWaterDistance')], ['Relative Avg', t('relativeAvg')], ['Relative Min', t('relativeMin')], ['Relative Max', t('relativeMax')], ['Absolute Avg', t('absoluteAvg')], ['Absolute Min', t('absoluteMin')], ['Absolute Max', t('absoluteMax')], ['Product Name', t('productName')], ['Unique Camera Model', t('uniqueCameraModel')], ['Flight Pitch [deg]', t('flightPitchDeg')], ['Gimbal Pitch [deg]', t('gimbalPitchDeg')], ['Gimbal Roll [degree]', t('gimbalRollDegree')], ['Flight Roll [degree]', t('flightRollDegree')], ['Flight Yaw [deg]', t('flightYawDeg')], ['Gimbal Yaw [deg]', t('gimbalYawDeg')], ['Flight X Speed [m/s]', t('flightXSpeedMps')], ['Flight Y Speed [m/s]', t('flightYSpeedMps')], ['Flight Z Speed [m/s]', t('flightZSpeedMps')]];
+    for (const [from, to] of prefixMap) if (text.startsWith(`${from}:`)) return text.replace(from, to);
+    if (text.startsWith('FOV [deg]: mismatch detected')) return text.replace('mismatch detected', t('mismatchDetected'));
+    return text.replace('(uniform)', `(${t('uniform')})`);
+  }
+  function translateInfoLines(lines) { return (Array.isArray(lines) ? lines : []).map(translateInfoLine); }
+  function setText(selector, key) {
+    const el = document.querySelector(selector);
+    if (!el) return;
+    let replaced = false;
+    el.childNodes.forEach(n => {
+      if (n.nodeType !== Node.TEXT_NODE) return;
+      if (!replaced) {
+        n.textContent = t(key);
+        replaced = true;
+      } else {
+        n.textContent = '';
+      }
+    });
+    if (!replaced) el.appendChild(document.createTextNode(t(key)));
+  }
+  function applyStaticI18n() {
+    document.documentElement.lang = uiLang;
+    document.title = t('appTitle');
+    const tabLabels = { image: 'imageAdjustment', misc: 'miscControl', save: 'save', exif: 'exifInfo', area: 'area' };
+    document.querySelector('.tabs')?.setAttribute('aria-label', t('controlPanels'));
+    document.querySelectorAll('.tab-button').forEach(btn => { const key = tabLabels[btn.dataset.tab]; if (key) btn.textContent = t(key); });
+    setText('#rulerModeIndicator', 'editRulerMode');
+    [['.tab-panel[data-panel="image"] fieldset:nth-of-type(1) legend','cameraWaterDistance'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(1) label','altitudeCorrectionM'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(2) legend','rotationCorrection'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(2) label','degree'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(3) legend','transparencyPct'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(3) label','opacity'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) legend','overlapEffect'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) label:nth-child(1)','none'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) label:nth-child(2)','swipe'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) label:nth-child(3)','redCyan'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(5) legend','keyboardShortcuts'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(6) legend','adjustmentControls'],['#fit','fitToView'],['#rulerMode','editRuler'],['#clearRuler','clearRuler'],['#revert','resetAdjustments'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(1) legend','saveOptions'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(1) label','cropOptimize'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(1) .info-lines','cropOptimizeHelp'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(2) legend','actions'],['#save','save'],['#cancelSave','cancel'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) legend','backgroundMap'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) .control-stack > label','showBackgroundMap'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) .radio-stack label:nth-child(1)','osmMap'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) .radio-stack label:nth-child(2)','gsiPhoto'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(2) legend','captureOrder'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(2) label','showCaptureOrder'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(2) .info-lines','captureOrderHelp'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(3) legend','imageRotationRule'],['#yawMode option[value="both"]','yawBoth'],['#yawMode option[value="flight_only"]','yawFlightOnly'],['#yawMode option[value="gimbal_only"]','yawGimbalOnly'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(3) label','reverseRotate'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(1) legend','productLens'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(2) legend','altitude'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(3) legend','flightSpeed'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(4) legend','pitch'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(5) legend','roll'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(6) legend','yaw'],['.tab-panel[data-panel="area"] legend','mosaicArea'],['#opacityDialogTitle','saveWithTransparencyTitle'],['#opacityDialogSave','save'],['#opacityDialogSaveOpaque','saveWithoutTransparency'],['#opacityDialogCancel','cancel']].forEach(([selector, key]) => setText(selector, key));
+    if (hud.textContent === 'Loading...') hud.textContent = t('loading');
+  }
   const basemapCanvas = document.getElementById('basemap');
   const canvas = document.getElementById('gl');
   const overlayCanvas = document.getElementById('overlay');
@@ -2765,7 +2861,7 @@ WEBUI_JS = r"""(() => {
   const overlayCtx = overlayCanvas.getContext('2d');
   const gl = canvas.getContext('webgl', { antialias: true, alpha: true });
   if (!gl) {
-    hud.textContent = 'WebGL is not available in this browser.';
+    hud.textContent = t('webglUnavailable');
     return;
   }
 
@@ -2865,8 +2961,8 @@ WEBUI_JS = r"""(() => {
   let areaStatsGeneration = 0;
   const areaStatsIdleMs = 500;
   const tileCache = new Map();
-  const altitudeShiftPanelWarningText = 'The offset between Relative Altitude and the actual altitude appears to have changed during the flight. In this case, the required altitude correction is likely to differ by location. Check "Show Capture Order" to identify where the offset changed, split the images before and after each change into separate folders, and process them separately.';
-  const altitudeShiftArrowWarningText = 'The actual altitude appears to have diverged from Relative Altitude. We recommend moving this and subsequent images to a separate folder and processing them separately.';
+  const altitudeShiftPanelWarningText = t('altitudeShiftPanelWarning');
+  const altitudeShiftArrowWarningText = t('altitudeShiftArrowWarning');
 
   function refreshSaveStatusPanel() {
     if (!saveStatusPanel || !statusEl || !altitudeShiftWarningEl || !saveActivityEl) return;
@@ -2930,27 +3026,27 @@ WEBUI_JS = r"""(() => {
       else if (/Yaw\b/.test(line)) yaw.push(line);
       else product.push(line);
     }
-    setLines(exifProductInfoEl, product);
-    setLines(exifSpeedInfoEl, speed);
-    setLines(exifPitchInfoEl, pitch);
-    setLines(exifRollInfoEl, roll);
-    setLines(exifYawInfoEl, yaw);
+    setLines(exifProductInfoEl, translateInfoLines(product));
+    setLines(exifSpeedInfoEl, translateInfoLines(speed));
+    setLines(exifPitchInfoEl, translateInfoLines(pitch));
+    setLines(exifRollInfoEl, translateInfoLines(roll));
+    setLines(exifYawInfoEl, translateInfoLines(yaw));
   }
   function updateInfo() {
     if (!state || !state.info) return;
-    setLines(cameraWaterInfoEl, state.info.camera_water_lines);
-    setLines(relativeAltitudeInfoEl, state.info.relative_altitude_lines);
-    setLines(yawDescriptionEl, state.info.yaw_description_lines);
-    setLines(shortcutInfoEl, state.info.shortcut_lines);
+    setLines(cameraWaterInfoEl, translateInfoLines(state.info.camera_water_lines));
+    setLines(relativeAltitudeInfoEl, translateInfoLines(state.info.relative_altitude_lines));
+    setLines(yawDescriptionEl, translateInfoLines(state.info.yaw_description_lines));
+    setLines(shortcutInfoEl, translateInfoLines(state.info.shortcut_lines));
     updateExifGroups(state.info.exif_lines);
     updateAltitudeShiftWarning();
   }
   function showAreaStats(area) {
-    const areaPrefix = area.approximate ? 'Approx. ' : '';
+    const areaPrefix = area.approximate ? `${t('approxPrefix')} ` : '';
     setLines(areaInfoEl, [
-      `${areaPrefix}Mosaic Image Area: ${formatAreaWithError(area.mosaic_area_m2, area.area_error_m2)}`,
-      `${areaPrefix}Overlapping Area: ${formatAreaWithError(area.overlap_area_m2, area.area_error_m2)}`,
-      `${areaPrefix}Overlap Ratio: ${formatPercentWithError(area.overlap_pct, area.overlap_pct_error)}`,
+      `${areaPrefix}${t('mosaicImageArea')}: ${formatAreaWithError(area.mosaic_area_m2, area.area_error_m2)}`,
+      `${areaPrefix}${t('overlappingArea')}: ${formatAreaWithError(area.overlap_area_m2, area.area_error_m2)}`,
+      `${areaPrefix}${t('overlapRatio')}: ${formatPercentWithError(area.overlap_pct, area.overlap_pct_error)}`,
     ]);
   }
   function isAreaTabActive() {
@@ -2960,11 +3056,11 @@ WEBUI_JS = r"""(() => {
     areaStatsGeneration += 1;
     clearTimeout(areaStatsTimer);
     areaStatsTimer = null;
-    if (isAreaTabActive()) setLines(areaInfoEl, 'Waiting for adjustment to stop...');
+    if (isAreaTabActive()) setLines(areaInfoEl, t('waitingForAdjustment'));
   }
   async function loadAreaStats(generation) {
     if (!isAreaTabActive() || generation !== areaStatsGeneration) return;
-    setLines(areaInfoEl, 'Calculating...');
+    setLines(areaInfoEl, t('calculating'));
     try {
       const res = await fetch('/api/area-stats');
       const area = await res.json();
@@ -2972,7 +3068,7 @@ WEBUI_JS = r"""(() => {
       showAreaStats(area);
     } catch (err) {
       if (isAreaTabActive() && generation === areaStatsGeneration) {
-        setLines(areaInfoEl, `Area calculation failed: ${err}`);
+        setLines(areaInfoEl, t('areaCalculationFailed', { error: err }));
       }
     }
   }
@@ -2980,7 +3076,7 @@ WEBUI_JS = r"""(() => {
     if (!isAreaTabActive()) return;
     clearTimeout(areaStatsTimer);
     const generation = ++areaStatsGeneration;
-    setLines(areaInfoEl, 'Waiting for adjustment to stop...');
+    setLines(areaInfoEl, t('waitingForAdjustment'));
     areaStatsTimer = setTimeout(() => loadAreaStats(generation), areaStatsIdleMs);
   }
   function photoById(id) {
@@ -3017,19 +3113,19 @@ WEBUI_JS = r"""(() => {
   }
   function tooltipLines(photo) {
     return [
-      { text: 'File' },
+      { text: t('file') },
       { text: `  ${photo.name}` },
       { text: '' },
-      { text: 'Exif' },
-      { text: `  Relative Altitude [m] : ${fmtNum(photo.alt_m)}`, altitude: true },
-      { text: `  Absolute Altitude [m] : ${fmtNum(photo.absolute_alt_m)}`, altitude: true },
-      { text: `  Abs - Rel Alt. [m]    : ${fmtAltDifference(photo.absolute_alt_m, photo.alt_m)}`, altitude: true },
-      { text: `  Flight Pitch [degree] : ${fmtNum(photo.flight_pitch_deg)}` },
-      { text: `  Gimbal Pitch [degree] : ${fmtNum(photo.gimbal_pitch_deg)}` },
-      { text: `  Flight Roll [degree]  : ${fmtNum(photo.flight_roll_deg)}` },
-      { text: `  Flight Yaw Degree     : ${fmtNum(photo.flight_yaw_deg)}` },
-      { text: `  Gimbal Yaw Degree     : ${fmtNum(photo.gimbal_yaw_deg)}` },
-      { text: `  Flight X/Y/Z Speed: ${fmtSpeed(photo.flight_x_speed_mps)}/${fmtSpeed(photo.flight_y_speed_mps)}/${fmtSpeed(photo.flight_z_speed_mps)} [m/s]` },
+      { text: t('exif') },
+      { text: `  ${t('relativeAltitudeM')} : ${fmtNum(photo.alt_m)}`, altitude: true },
+      { text: `  ${t('absoluteAltitudeM')} : ${fmtNum(photo.absolute_alt_m)}`, altitude: true },
+      { text: `  ${t('absRelAltM')}    : ${fmtAltDifference(photo.absolute_alt_m, photo.alt_m)}`, altitude: true },
+      { text: `  ${t('flightPitchDegree')} : ${fmtNum(photo.flight_pitch_deg)}` },
+      { text: `  ${t('gimbalPitchDegree')} : ${fmtNum(photo.gimbal_pitch_deg)}` },
+      { text: `  ${t('flightRollDegreeLabel')}  : ${fmtNum(photo.flight_roll_deg)}` },
+      { text: `  ${t('flightYawDegree')}     : ${fmtNum(photo.flight_yaw_deg)}` },
+      { text: `  ${t('gimbalYawDegree')}     : ${fmtNum(photo.gimbal_yaw_deg)}` },
+      { text: `  ${t('flightXYZSpeed')}: ${fmtSpeed(photo.flight_x_speed_mps)}/${fmtSpeed(photo.flight_y_speed_mps)}/${fmtSpeed(photo.flight_z_speed_mps)} [m/s]` },
     ];
   }
   function pointInTri(px, py, a, b, c) {
@@ -3177,16 +3273,16 @@ WEBUI_JS = r"""(() => {
   }
   function setRulerStatus() {
     if (!ruler) {
-      setStatus(rulerMode ? 'Ruler: click the start point on an image.' : 'Ruler cleared');
+      setStatus(rulerMode ? t('rulerStart') : t('rulerCleared'));
       return;
     }
     if (!ruler.complete) {
-      setStatus('Ruler: click the end point.');
+      setStatus(t('rulerEnd'));
       return;
     }
     const a = rulerPointToPreview(ruler.start);
     const b = rulerPointToPreview(ruler.end);
-    setStatus(`Ruler: ${formatRulerMeters(a && b ? rulerMeters(a, b) : NaN)}`);
+    setStatus(t('rulerValue', { value: formatRulerMeters(a && b ? rulerMeters(a, b) : NaN) }));
   }
   function drawRulerOverlay() {
     if (!overlayCtx || !ruler || !ruler.start) return;
@@ -3285,12 +3381,12 @@ WEBUI_JS = r"""(() => {
   }
   function chooseOpacitySaveMode(opacity) {
     return new Promise(resolve => {
-      opacityDialogTitle.textContent = 'Save with transparency?';
-      opacityDialogMessage.textContent = `Opacity is currently ${opacity}%. Choose how to save the mosaic.`;
-      opacityDialogSave.textContent = 'Save';
-      opacityDialogSaveOpaque.textContent = 'Save without transparency';
+      opacityDialogTitle.textContent = t('saveWithTransparencyTitle');
+      opacityDialogMessage.textContent = t('opacitySaveMessage', { opacity });
+      opacityDialogSave.textContent = t('save');
+      opacityDialogSaveOpaque.textContent = t('saveWithoutTransparency');
       opacityDialogSaveOpaque.style.display = '';
-      opacityDialogCancel.textContent = 'Cancel';
+      opacityDialogCancel.textContent = t('cancel');
       modalBackdrop.classList.add('active');
       function cleanup(result) {
         modalBackdrop.classList.remove('active');
@@ -3320,11 +3416,11 @@ WEBUI_JS = r"""(() => {
   }
   function chooseMemoryForceSave(shortageBytes) {
     return new Promise(resolve => {
-      opacityDialogTitle.textContent = 'Insufficient memory may be';
-      opacityDialogMessage.textContent = `There may be about ${formatGb(shortageBytes)} less available memory than required for saving. A shortage of around 5 GB may still be possible to run, but anything beyond that depends on the situation. Do you want to continue?`;
-      opacityDialogSave.textContent = 'Force Save';
+      opacityDialogTitle.textContent = t('insufficientMemoryTitle');
+      opacityDialogMessage.textContent = t('memoryForceMessage', { shortage: formatGb(shortageBytes) });
+      opacityDialogSave.textContent = t('forceSave');
       opacityDialogSaveOpaque.style.display = 'none';
-      opacityDialogCancel.textContent = 'Cancel';
+      opacityDialogCancel.textContent = t('cancel');
       modalBackdrop.classList.add('active');
       function cleanup(result) {
         modalBackdrop.classList.remove('active');
@@ -3351,12 +3447,12 @@ WEBUI_JS = r"""(() => {
     });
   }
   function showSaveFailureDialog(error) {
-    const message = String(error || 'unknown error');
+    const message = String(error || t('unknownError'));
     if (shownSaveError === message) return;
     shownSaveError = message;
-    opacityDialogTitle.textContent = 'Save failed';
+    opacityDialogTitle.textContent = t('saveFailedTitle');
     opacityDialogMessage.textContent = message;
-    opacityDialogSave.textContent = 'OK';
+    opacityDialogSave.textContent = t('ok');
     opacityDialogSaveOpaque.style.display = 'none';
     opacityDialogCancel.style.display = 'none';
     modalBackdrop.classList.add('active');
@@ -3438,7 +3534,7 @@ WEBUI_JS = r"""(() => {
     const photosToLoad = [...state.photos];
     layers.forEach(l => gl.deleteTexture(l.texture));
     layers = [];
-    setStatus(`Loading ${photosToLoad.length} textures...`);
+    setStatus(t('loadingTextures', { count: photosToLoad.length }));
     let loaded = 0;
     for (const p of photosToLoad) {
       if (generation !== loadGeneration) return;
@@ -3448,13 +3544,13 @@ WEBUI_JS = r"""(() => {
         const latest = photoById(p.id) || p;
         layers.push({ id: p.id, texture: makeTexture(img), pos: posData(latest.corners), name: p.name });
         loaded += 1;
-        setStatus(`Loaded ${loaded}/${photosToLoad.length} textures`);
+        setStatus(t('loadedTextures', { loaded, total: photosToLoad.length }));
         draw();
       } catch (err) {
         console.warn('Image load failed', p.url, err);
       }
     }
-    setStatus(`Ready: ${loaded}/${photosToLoad.length} textures`);
+    setStatus(t('readyTextures', { loaded, total: photosToLoad.length }));
   }
   function updateLayerGeometry() {
     const byId = new Map(layers.map(layer => [layer.id, layer]));
@@ -3586,7 +3682,7 @@ WEBUI_JS = r"""(() => {
   function drawMapAttribution(ctx) {
     if (!basemapEnabled()) return;
     const provider = basemapProvider();
-    const text = provider === 'gsi' ? 'Source: 国土地理院 地理院タイル' : '© OpenStreetMap contributors';
+    const text = provider === 'gsi' ? t('sourceGsi') : '© OpenStreetMap contributors';
     ctx.save();
     ctx.font = '12px system-ui, -apple-system, Segoe UI, sans-serif';
     const pad = 6;
@@ -3909,10 +4005,10 @@ WEBUI_JS = r"""(() => {
     const memAvailable = memoryInfo && memoryInfo.available ? memoryInfo.available : 'N/A';
     const memLabel = memoryInfo && memoryInfo.is_wsl ? ' (WSL)' : '';
     const memPct = memoryInfo && Number.isFinite(Number(memoryInfo.available_pct)) ? Math.max(0, Math.min(100, Number(memoryInfo.available_pct))) : 0;
-    const lines = `bvpp WebUI\n${state.photos.length} photos\npreview ${previewW} x ${previewH} px\nsave ${saveW} x ${saveH} px\nestimated memory required for saving ${mem}\nzoom ${(zoom * 100).toFixed(1)}%`;
+    const lines = `bvpp WebUI\n${state.photos.length} ${t('photos')}\n${t('preview')} ${previewW} x ${previewH} px\n${t('saveSize')} ${saveW} x ${saveH} px\n${t('estimatedMemoryRequired')} ${mem}\n${t('zoom')} ${(zoom * 100).toFixed(1)}%`;
     hud.innerHTML =
       `<div class="hud-lines">${escapeHtml(lines)}</div>` +
-      `<div class="mem-row">physical memory${memLabel} ${escapeHtml(memTotal)}<br>available memory${memLabel} ${escapeHtml(memAvailable)}</div>` +
+      `<div class="mem-row">${escapeHtml(t('physicalMemory'))}${memLabel} ${escapeHtml(memTotal)}<br>${escapeHtml(t('availableMemory'))}${memLabel} ${escapeHtml(memAvailable)}</div>` +
       `<div class="mem-bar"><div class="mem-fill" style="width:${memPct.toFixed(1)}%"></div></div>`;
     updateScaleIndicator();
     drawSequenceOverlay();
@@ -3978,7 +4074,7 @@ WEBUI_JS = r"""(() => {
       opacity_pct: parseFloat(opacityEl.value || '100'),
       crop_optimize: cropOptimizeEl.checked,
     };
-    setStatus('Updating geometry...');
+    setStatus(t('updatingGeometry'));
     try {
       const res = await fetch('/api/options', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
       const nextState = await res.json();
@@ -3988,7 +4084,7 @@ WEBUI_JS = r"""(() => {
       if (reloadTextures || !updateLayerGeometry()) {
         await rebuildLayers();
       } else {
-        setStatus('Ready: geometry updated');
+        setStatus(t('readyGeometryUpdated'));
       }
       draw();
       scheduleAreaStats();
@@ -3999,7 +4095,7 @@ WEBUI_JS = r"""(() => {
         queuedOptionReloadTextures = false;
         clearTimeout(optionTimer);
         optionTimer = null;
-        updateOptions(queuedReloadTextures).catch(err => setStatus(`Update failed: ${err}`));
+        updateOptions(queuedReloadTextures).catch(err => setStatus(t('updateFailed', { error: err })));
       }
     }
   }
@@ -4114,7 +4210,7 @@ WEBUI_JS = r"""(() => {
     focusStage();
   });
   document.getElementById('revert').addEventListener('click', async () => {
-    setStatus('Reverting...');
+    setStatus(t('reverting'));
     const res = await fetch('/api/revert', { method: 'POST' });
     state = await res.json();
     syncControlsFromState();
@@ -4122,12 +4218,12 @@ WEBUI_JS = r"""(() => {
     scheduleAreaStats();
     fit();
     draw();
-    setStatus('Reverted to original');
+    setStatus(t('reverted'));
   });
   function renderSaveStatus(payload) {
     if (!payload || !payload.active) {
       if (payload && payload.error) {
-        setStatus(`Save failed: ${payload.error}`);
+        setStatus(t('saveFailed', { error: payload.error }));
         showSaveFailureDialog(payload.error);
       }
       setSaveActive(false);
@@ -4137,27 +4233,27 @@ WEBUI_JS = r"""(() => {
       setSaveActive(true, true);
       const pct = payload.total ? Math.round((payload.done / payload.total) * 100) : 0;
       const filePart = payload.current ? `: ${payload.current}` : '';
-      setStatus(`${payload.phase} ${pct}% (${payload.done}/${payload.total})${filePart}`);
+      setStatus(`${translatePhase(payload.phase)} ${pct}% (${payload.done}/${payload.total})${filePart}`);
       return true;
     }
     if (payload.status === 'saving') {
       setSaveActive(true, false);
-      setStatus(payload.save_text || 'Saving...');
+      setStatus(translateSaveText(payload.save_text));
       return true;
     }
     if (payload.status === 'done') {
       setSaveActive(false);
-      setStatus(`Saved: ${payload.path}`);
+      setStatus(t('saved', { path: payload.path }));
       return false;
     }
     if (payload.status === 'cancelled') {
       setSaveActive(false);
-      setStatus('Save cancelled');
+      setStatus(t('saveCancelled'));
       return false;
     }
     setSaveActive(false);
-    const error = payload.error || 'unknown error';
-    setStatus(`Save failed: ${error}`);
+    const error = payload.error || t('unknownError');
+    setStatus(t('saveFailed', { error }));
     showSaveFailureDialog(error);
     return false;
   }
@@ -4171,7 +4267,7 @@ WEBUI_JS = r"""(() => {
         savePollTimer = null;
       }
     } catch (err) {
-      setStatus(`Save status failed: ${err}`);
+      setStatus(t('saveStatusFailed', { error: err }));
       setSaveActive(false);
       if (savePollTimer) {
         clearInterval(savePollTimer);
@@ -4204,7 +4300,7 @@ WEBUI_JS = r"""(() => {
         await updateOptions(false);
       }
     }
-    setStatus('Starting full-resolution mosaic save...');
+    setStatus(t('startingSave'));
     setSaveActive(true);
     try {
       const res = await fetch('/api/save', {
@@ -4219,12 +4315,12 @@ WEBUI_JS = r"""(() => {
       }
       if (keepPolling) pollSaveStatus();
     } catch (err) {
-      setStatus(`Save start failed: ${err}`);
+      setStatus(t('saveStartFailed', { error: err }));
       setSaveActive(false);
     }
   });
   cancelSaveBtn.addEventListener('click', async () => {
-    setStatus('Cancelling save...');
+    setStatus(t('cancellingSave'));
     await fetch('/api/cancel-save', { method: 'POST' });
     pollSaveStatus();
   });
@@ -4410,6 +4506,7 @@ WEBUI_JS = r"""(() => {
       if (pairModeActive(compareMode())) draw();
     }
   });
+  applyStaticI18n();
   updateRulerButtons();
   resize();
   setMemoryPolling(5000);
