@@ -32,6 +32,7 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import base64
 import gc
 import glob
 import mimetypes
@@ -39,15 +40,18 @@ import io
 import json
 import math
 import os
+import posixpath
 import subprocess
 import sys
 import threading
 import webbrowser
+import zipfile
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import BinaryIO, Dict, Iterable, List, Optional, Tuple, Union
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -2534,6 +2538,8 @@ WEBUI_HTML = """<!doctype html>
     .save-options { flex: 0 0 220px; width: 220px; max-width: 220px; }
     .save-options .info-lines { white-space: normal; overflow-wrap: anywhere; }
     .wide { min-width: 290px; max-width: 360px; }
+    .kmz-overlay { flex: 0 0 300px; max-width: 380px; }
+    .kmz-overlay input[type="file"] { max-width: 100%; font-size: 12px; }
     .exif-group { flex: 1 1 180px; min-width: 170px; }
     .exif-product { flex-basis: 260px; }
     input, select, button { font: inherit; }
@@ -2664,6 +2670,16 @@ WEBUI_HTML = """<!doctype html>
             <div id="yawDescription" class="info-lines"></div>
           </div>
         </fieldset>
+        <fieldset class="wide kmz-overlay">
+          <legend>KMZ Overlay</legend>
+          <div class="control-stack">
+            <input id="kmzFile" type="file" accept=".kmz,application/vnd.google-earth.kmz">
+            <div class="control-row">
+              <button id="clearKmz" type="button" disabled>Clear</button>
+            </div>
+            <div id="kmzInfo" class="info-lines"></div>
+          </div>
+        </fieldset>
       </div>
       <div class="tab-panel" data-panel="exif">
         <fieldset class="exif-group exif-product">
@@ -2729,6 +2745,7 @@ WEBUI_JS = r"""(() => {
       showBackgroundMap: 'Show Background Map', osmMap: 'OpenStreetMap (Map)', gsiPhoto: '日本国土地理院 (Photo)', captureOrder: 'Capture Order', showCaptureOrder: 'Show Capture Order',
       captureOrderHelp: 'Shows blue center markers, arrows from earlier to later captures, and capture time labels.', imageRotationRule: 'Image Rotation Rule', yawBoth: 'Use Flight + Gimbal Yaw Degree',
       yawFlightOnly: 'Use Flight Yaw Degree', yawGimbalOnly: 'Use Gimbal Yaw Degree', reverseRotate: 'Reverse rotate', productLens: 'Product/Lens', altitude: 'Altitude', flightSpeed: 'Flight Speed', pitch: 'Pitch', roll: 'Roll', yaw: 'Yaw', mosaicArea: 'Mosaic Area',
+      kmzOverlay: 'KMZ Overlay', clear: 'Clear', loadingKmz: 'Loading KMZ...', kmzLoaded: 'Loaded: {name} ({count} feature(s))', kmzCleared: 'KMZ overlay cleared', kmzNoOverlay: 'No displayable Point or GroundOverlay found in this KMZ.', kmzLoadFailed: 'KMZ load failed: {error}',
       saveWithTransparencyTitle: 'Save with transparency?', saveWithoutTransparency: 'Save without transparency', insufficientMemoryTitle: 'Insufficient memory may be', forceSave: 'Force Save', saveFailedTitle: 'Save failed', ok: 'OK', editRulerMode: 'EDIT RULER MODE',
       altitudeShiftPanelWarning: 'The offset between Relative Altitude and the actual altitude appears to have changed during the flight. In this case, the required altitude correction is likely to differ by location. Check "Show Capture Order" to identify where the offset changed, split the images before and after each change into separate folders, and process them separately.',
       altitudeShiftArrowWarning: 'The actual altitude appears to have diverged from Relative Altitude. We recommend moving this and subsequent images to a separate folder and processing them separately.', approxPrefix: 'Approx.', mosaicImageArea: 'Mosaic Image Area', overlappingArea: 'Overlapping Area', overlapRatio: 'Overlap Ratio',
@@ -2750,6 +2767,7 @@ WEBUI_JS = r"""(() => {
       showBackgroundMap: '背景地図を表示', osmMap: 'OpenStreetMap (地図)', gsiPhoto: '日本国土地理院 (写真)', captureOrder: '撮影順', showCaptureOrder: '撮影順を表示',
       captureOrderHelp: '青い中心マーカー、撮影の前後を示す矢印、撮影時刻ラベルを表示します。', imageRotationRule: '画像回転ルール', yawBoth: '飛行Yaw角 + ジンバルYaw角を使用',
       yawFlightOnly: '飛行Yaw角を使用', yawGimbalOnly: 'ジンバルYaw角を使用', reverseRotate: '逆回転', productLens: '製品/レンズ', altitude: '高度', flightSpeed: '飛行速度', pitch: 'ピッチ', roll: 'ロール', yaw: 'Yaw', mosaicArea: 'モザイク面積',
+      kmzOverlay: 'KMZ読み込み', clear: 'クリア', loadingKmz: 'KMZを読み込み中...', kmzLoaded: '読み込み完了: {name} ({count} 件)', kmzCleared: 'KMZ表示を消去しました', kmzNoOverlay: 'このKMZには表示可能なPointまたはGroundOverlayがありません。', kmzLoadFailed: 'KMZ読み込みに失敗しました: {error}',
       saveWithTransparencyTitle: '透過ありで保存しますか？', saveWithoutTransparency: '透過なしで保存', insufficientMemoryTitle: 'メモリが不足している可能性があります', forceSave: '強制保存', saveFailedTitle: '保存に失敗しました', ok: 'OK', editRulerMode: 'ルーラー編集モード',
       altitudeShiftPanelWarning: 'Relative Altitude と実高度の差が飛行中に変化しているようです。この場合、必要な高度補正は場所によって異なる可能性があります。「撮影順を表示」でずれが変わった位置を確認し、変化の前後で画像を別フォルダに分けて、それぞれ処理してください。',
       altitudeShiftArrowWarning: '実高度と Relative Altitude の差が変化したようです。この画像以降を別フォルダに移して、分けて処理することを推奨します。', approxPrefix: '概算', mosaicImageArea: 'モザイク画像面積', overlappingArea: '重複面積', overlapRatio: '重複率',
@@ -2810,7 +2828,7 @@ WEBUI_JS = r"""(() => {
     document.querySelector('.tabs')?.setAttribute('aria-label', t('controlPanels'));
     document.querySelectorAll('.tab-button').forEach(btn => { const key = tabLabels[btn.dataset.tab]; if (key) btn.textContent = t(key); });
     setText('#rulerModeIndicator', 'editRulerMode');
-    [['.tab-panel[data-panel="image"] fieldset:nth-of-type(1) legend','cameraWaterDistance'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(1) label','altitudeCorrectionM'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(2) legend','rotationCorrection'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(2) label','degree'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(3) legend','transparencyPct'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(3) label','opacity'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) legend','overlapEffect'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) label:nth-child(1)','none'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) label:nth-child(2)','swipe'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) label:nth-child(3)','redCyan'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(5) legend','keyboardShortcuts'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(6) legend','adjustmentControls'],['#fit','fitToView'],['#rulerMode','editRuler'],['#clearRuler','clearRuler'],['#revert','resetAdjustments'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(1) legend','saveOptions'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(1) label','cropOptimize'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(1) .info-lines','cropOptimizeHelp'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(2) legend','actions'],['#save','save'],['#cancelSave','cancel'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) legend','backgroundMap'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) .control-stack > label','showBackgroundMap'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) .radio-stack label:nth-child(1)','osmMap'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) .radio-stack label:nth-child(2)','gsiPhoto'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(2) legend','captureOrder'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(2) label','showCaptureOrder'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(2) .info-lines','captureOrderHelp'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(3) legend','imageRotationRule'],['#yawMode option[value="both"]','yawBoth'],['#yawMode option[value="flight_only"]','yawFlightOnly'],['#yawMode option[value="gimbal_only"]','yawGimbalOnly'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(3) label','reverseRotate'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(1) legend','productLens'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(2) legend','altitude'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(3) legend','flightSpeed'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(4) legend','pitch'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(5) legend','roll'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(6) legend','yaw'],['.tab-panel[data-panel="area"] legend','mosaicArea'],['#opacityDialogTitle','saveWithTransparencyTitle'],['#opacityDialogSave','save'],['#opacityDialogSaveOpaque','saveWithoutTransparency'],['#opacityDialogCancel','cancel']].forEach(([selector, key]) => setText(selector, key));
+    [['.tab-panel[data-panel="image"] fieldset:nth-of-type(1) legend','cameraWaterDistance'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(1) label','altitudeCorrectionM'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(2) legend','rotationCorrection'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(2) label','degree'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(3) legend','transparencyPct'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(3) label','opacity'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) legend','overlapEffect'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) label:nth-child(1)','none'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) label:nth-child(2)','swipe'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(4) label:nth-child(3)','redCyan'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(5) legend','keyboardShortcuts'],['.tab-panel[data-panel="image"] fieldset:nth-of-type(6) legend','adjustmentControls'],['#fit','fitToView'],['#rulerMode','editRuler'],['#clearRuler','clearRuler'],['#revert','resetAdjustments'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(1) legend','saveOptions'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(1) label','cropOptimize'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(1) .info-lines','cropOptimizeHelp'],['.tab-panel[data-panel="save"] fieldset:nth-of-type(2) legend','actions'],['#save','save'],['#cancelSave','cancel'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) legend','backgroundMap'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) .control-stack > label','showBackgroundMap'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) .radio-stack label:nth-child(1)','osmMap'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(1) .radio-stack label:nth-child(2)','gsiPhoto'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(2) legend','captureOrder'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(2) label','showCaptureOrder'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(2) .info-lines','captureOrderHelp'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(3) legend','imageRotationRule'],['#yawMode option[value="both"]','yawBoth'],['#yawMode option[value="flight_only"]','yawFlightOnly'],['#yawMode option[value="gimbal_only"]','yawGimbalOnly'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(3) label','reverseRotate'],['.tab-panel[data-panel="misc"] fieldset:nth-of-type(4) legend','kmzOverlay'],['#clearKmz','clear'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(1) legend','productLens'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(2) legend','altitude'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(3) legend','flightSpeed'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(4) legend','pitch'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(5) legend','roll'],['.tab-panel[data-panel="exif"] fieldset:nth-of-type(6) legend','yaw'],['.tab-panel[data-panel="area"] legend','mosaicArea'],['#opacityDialogTitle','saveWithTransparencyTitle'],['#opacityDialogSave','save'],['#opacityDialogSaveOpaque','saveWithoutTransparency'],['#opacityDialogCancel','cancel']].forEach(([selector, key]) => setText(selector, key));
     if (hud.textContent === 'Loading...') hud.textContent = t('loading');
   }
   const basemapCanvas = document.getElementById('basemap');
@@ -2837,6 +2855,9 @@ WEBUI_JS = r"""(() => {
   const showCaptureOrderEl = document.getElementById('showCaptureOrder');
   const showBasemapEl = document.getElementById('showBasemap');
   const basemapProviderEls = Array.from(document.querySelectorAll('input[name="basemapProvider"]'));
+  const kmzFileEl = document.getElementById('kmzFile');
+  const clearKmzBtn = document.getElementById('clearKmz');
+  const kmzInfoEl = document.getElementById('kmzInfo');
   const saveBtn = document.getElementById('save');
   const cancelSaveBtn = document.getElementById('cancelSave');
   const modalBackdrop = document.getElementById('modalBackdrop');
@@ -2959,6 +2980,8 @@ WEBUI_JS = r"""(() => {
   let shownSaveError = null;
   let areaStatsTimer = null;
   let areaStatsGeneration = 0;
+  let kmzOverlay = null;
+  let kmzLoadGeneration = 0;
   const areaStatsIdleMs = 500;
   const tileCache = new Map();
   const altitudeShiftPanelWarningText = t('altitudeShiftPanelWarning');
@@ -3523,6 +3546,23 @@ WEBUI_JS = r"""(() => {
       img.src = url;
     });
   }
+  function loadKmzImage(url, generation, overlayItem) {
+    return new Promise(resolve => {
+      const img = new Image();
+      img.onload = () => {
+        if (generation === kmzLoadGeneration && kmzOverlay && kmzOverlay.items.includes(overlayItem)) {
+          overlayItem.image = img;
+          draw();
+        }
+        resolve(img);
+      };
+      img.onerror = () => {
+        overlayItem.failed = true;
+        resolve(null);
+      };
+      img.src = url;
+    });
+  }
   function posData(c) {
     return new Float32Array([
       c[0][0], c[0][1], c[1][0], c[1][1], c[2][0], c[2][1],
@@ -3566,6 +3606,89 @@ WEBUI_JS = r"""(() => {
   }
   function previewToScreen(pt) {
     return [(pt[0] - pan[0]) * zoom, (pt[1] - pan[1]) * zoom];
+  }
+  function rotatePreviewCorners(corners, degrees) {
+    const angle = -Number(degrees || 0) * Math.PI / 180;
+    if (!Number.isFinite(angle) || Math.abs(angle) < 1e-9) return corners;
+    const cx = corners.reduce((sum, p) => sum + p[0], 0) / corners.length;
+    const cy = corners.reduce((sum, p) => sum + p[1], 0) / corners.length;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    return corners.map(p => {
+      const dx = p[0] - cx;
+      const dy = p[1] - cy;
+      return [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
+    });
+  }
+  function kmzItemPreviewCorners(item) {
+    if (!item) return null;
+    if (Array.isArray(item.coordinates) && item.coordinates.length >= 4) {
+      return item.coordinates.slice(0, 4).map(coord => latLonToPreview(coord.lat, coord.lon));
+    }
+    const box = item.lat_lon_box;
+    if (!box) return null;
+    const corners = [
+      latLonToPreview(box.north, box.west),
+      latLonToPreview(box.north, box.east),
+      latLonToPreview(box.south, box.east),
+      latLonToPreview(box.south, box.west),
+    ];
+    return rotatePreviewCorners(corners, Number(box.rotation || 0));
+  }
+  function drawImageInQuad(ctx, img, corners) {
+    if (!img || !corners || corners.length < 4) return;
+    const pts = corners.map(previewToScreen);
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < 4; i += 1) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+    ctx.clip();
+    const w = img.naturalWidth || img.width || 1;
+    const h = img.naturalHeight || img.height || 1;
+    const ux = [(pts[1][0] - pts[0][0]) / w, (pts[1][1] - pts[0][1]) / w];
+    const vx = [(pts[3][0] - pts[0][0]) / h, (pts[3][1] - pts[0][1]) / h];
+    ctx.setTransform(ux[0], ux[1], vx[0], vx[1], pts[0][0], pts[0][1]);
+    ctx.drawImage(img, 0, 0, w, h);
+    ctx.restore();
+  }
+  function drawKmzOverlay(ctx) {
+    if (!kmzOverlay) return;
+    ctx.save();
+    ctx.globalAlpha = 0.72;
+    for (const item of Array.isArray(kmzOverlay.items) ? kmzOverlay.items : []) {
+      if (!item.image) continue;
+      drawImageInQuad(ctx, item.image, kmzItemPreviewCorners(item));
+    }
+    ctx.restore();
+  }
+  function drawKmzMarkers(ctx) {
+    if (!kmzOverlay || !Array.isArray(kmzOverlay.markers)) return;
+    ctx.save();
+    ctx.font = '11px system-ui, -apple-system, Segoe UI, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    for (const marker of kmzOverlay.markers) {
+      const p = previewToScreen(latLonToPreview(marker.lat, marker.lon));
+      if (p[0] < -80 || p[1] < -40 || p[0] > overlayCanvas.width + 120 || p[1] > overlayCanvas.height + 40) continue;
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], 4, 0, Math.PI * 2);
+      ctx.fillStyle = '#d93025';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(255,255,255,.95)';
+      ctx.stroke();
+      const label = String(marker.name || '').trim();
+      if (!label) continue;
+      const x = p[0] + 7;
+      const y = p[1];
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(255,255,255,.95)';
+      ctx.strokeText(label, x, y);
+      ctx.fillStyle = '#202124';
+      ctx.fillText(label, x, y);
+    }
+    ctx.restore();
   }
   function latLonToPreview(lat, lon) {
     const g = state && state.georef ? state.georef : null;
@@ -3774,6 +3897,8 @@ WEBUI_JS = r"""(() => {
   function drawSequenceOverlay() {
     if (!overlayCtx) return;
     overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    drawKmzOverlay(overlayCtx);
+    drawKmzMarkers(overlayCtx);
     drawMapAttribution(overlayCtx);
     drawLayerOutlines(overlayCtx);
     if (!state || !captureOrderEnabled()) {
@@ -4195,6 +4320,57 @@ WEBUI_JS = r"""(() => {
     draw();
   });
   basemapProviderEls.forEach(el => el.addEventListener('change', draw));
+  async function loadKmzOverlay(file) {
+    if (!file) return;
+    const generation = ++kmzLoadGeneration;
+    kmzOverlay = null;
+    clearKmzBtn.disabled = true;
+    setLines(kmzInfoEl, t('loadingKmz'));
+    draw();
+    try {
+      const res = await fetch(`/api/kmz-overlay?name=${encodeURIComponent(file.name || 'overlay.kmz')}`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/vnd.google-earth.kmz'},
+        body: await file.arrayBuffer(),
+      });
+      const payload = await res.json();
+      if (!res.ok || !payload.ok) throw new Error(payload.error || res.statusText);
+      if (generation !== kmzLoadGeneration) return;
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      const markers = Array.isArray(payload.markers) ? payload.markers : [];
+      const featureCount = items.length + markers.length;
+      if (!featureCount) {
+        setLines(kmzInfoEl, t('kmzNoOverlay'));
+        return;
+      }
+      kmzOverlay = { name: payload.name || file.name, items, markers };
+      clearKmzBtn.disabled = false;
+      setLines(kmzInfoEl, t('kmzLoaded', { name: kmzOverlay.name, count: featureCount }));
+      items.forEach(item => loadKmzImage(item.data_url, generation, item));
+      draw();
+    } catch (err) {
+      if (generation !== kmzLoadGeneration) return;
+      kmzOverlay = null;
+      clearKmzBtn.disabled = true;
+      setLines(kmzInfoEl, t('kmzLoadFailed', { error: err && err.message ? err.message : err }));
+      draw();
+    } finally {
+      if (kmzFileEl) kmzFileEl.value = '';
+    }
+  }
+  kmzFileEl.addEventListener('change', () => {
+    const file = kmzFileEl.files && kmzFileEl.files[0] ? kmzFileEl.files[0] : null;
+    loadKmzOverlay(file);
+  });
+  clearKmzBtn.addEventListener('click', () => {
+    kmzLoadGeneration += 1;
+    kmzOverlay = null;
+    clearKmzBtn.disabled = true;
+    if (kmzFileEl) kmzFileEl.value = '';
+    setLines(kmzInfoEl, t('kmzCleared'));
+    draw();
+    focusStage();
+  });
   tabButtons.forEach(btn => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
   document.getElementById('fit').addEventListener('click', fit);
   rulerModeBtn.addEventListener('click', () => {
@@ -4757,6 +4933,135 @@ def _build_area_stats(
     }
 
 
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _first_descendant(elem: ET.Element, local_name: str) -> Optional[ET.Element]:
+    for child in elem.iter():
+        if _xml_local_name(child.tag) == local_name:
+            return child
+    return None
+
+
+def _first_descendant_text(elem: ET.Element, local_name: str) -> Optional[str]:
+    child = _first_descendant(elem, local_name)
+    if child is None or child.text is None:
+        return None
+    text = child.text.strip()
+    return text or None
+
+
+def _float_text(elem: ET.Element, local_name: str) -> Optional[float]:
+    text = _first_descendant_text(elem, local_name)
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_kml_coordinates(text: str) -> List[Dict[str, float]]:
+    coords: List[Dict[str, float]] = []
+    for item in text.replace("\n", " ").replace("\t", " ").split():
+        parts = item.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            lon = float(parts[0])
+            lat = float(parts[1])
+        except ValueError:
+            continue
+        coords.append({"lon": lon, "lat": lat})
+    return coords
+
+
+def _safe_kmz_member_path(base_name: str, href: str) -> str:
+    href = href.strip().replace("\\", "/")
+    if not href or "://" in href or href.startswith("/"):
+        raise FileNotFoundError("external or absolute GroundOverlay icon href is not supported")
+    joined = posixpath.normpath(posixpath.join(posixpath.dirname(base_name), href))
+    if joined.startswith("../") or joined == "..":
+        raise FileNotFoundError("invalid GroundOverlay icon href")
+    return joined
+
+
+def _parse_kmz_preview_features(data: bytes, display_name: str) -> Dict[str, object]:
+    items: List[Dict[str, object]] = []
+    markers: List[Dict[str, object]] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = zf.namelist()
+        kml_names = [n for n in names if n.lower().endswith(".kml")]
+        if not kml_names:
+            raise ValueError("KMZ does not contain a KML file")
+        kml_name = "doc.kml" if "doc.kml" in kml_names else kml_names[0]
+        root = ET.fromstring(zf.read(kml_name))
+        for placemark in root.iter():
+            if _xml_local_name(placemark.tag) != "Placemark":
+                continue
+            point = _first_descendant(placemark, "Point")
+            if point is None:
+                continue
+            coord_text = _first_descendant_text(point, "coordinates")
+            if not coord_text:
+                continue
+            coords = _parse_kml_coordinates(coord_text)
+            if not coords:
+                continue
+            coord = coords[0]
+            markers.append(
+                {
+                    "name": _first_descendant_text(placemark, "name") or "",
+                    "lat": coord["lat"],
+                    "lon": coord["lon"],
+                }
+            )
+        for overlay in root.iter():
+            if _xml_local_name(overlay.tag) != "GroundOverlay":
+                continue
+            icon = _first_descendant(overlay, "Icon")
+            href = _first_descendant_text(icon, "href") if icon is not None else None
+            if not href:
+                continue
+            member_name = _safe_kmz_member_path(kml_name, href)
+            if member_name not in names:
+                continue
+            image_data = zf.read(member_name)
+            mime = mimetypes.guess_type(member_name)[0] or "application/octet-stream"
+            item: Dict[str, object] = {
+                "name": _first_descendant_text(overlay, "name") or posixpath.basename(member_name),
+                "data_url": f"data:{mime};base64,{base64.b64encode(image_data).decode('ascii')}",
+            }
+            quad = _first_descendant(overlay, "LatLonQuad")
+            quad_coords = _first_descendant_text(quad, "coordinates") if quad is not None else None
+            if quad_coords:
+                coords = _parse_kml_coordinates(quad_coords)
+                if len(coords) >= 4:
+                    # gx:LatLonQuad is lower-left, lower-right, upper-right, upper-left.
+                    # The canvas mapper expects upper-left, upper-right, lower-right, lower-left.
+                    item["coordinates"] = [coords[3], coords[2], coords[1], coords[0]]
+            if "coordinates" not in item:
+                box = _first_descendant(overlay, "LatLonBox")
+                if box is None:
+                    continue
+                north = _float_text(box, "north")
+                south = _float_text(box, "south")
+                east = _float_text(box, "east")
+                west = _float_text(box, "west")
+                if None in (north, south, east, west):
+                    continue
+                item["lat_lon_box"] = {
+                    "north": north,
+                    "south": south,
+                    "east": east,
+                    "west": west,
+                    "rotation": _float_text(box, "rotation") or 0.0,
+                }
+            items.append(item)
+    return {"ok": True, "name": display_name, "items": items, "markers": markers}
+
+
 @dataclass
 class WebSaveJob:
     total: int
@@ -5213,6 +5518,13 @@ def _make_webui_handler(session: WebMosaicSession, debug: bool = False):
             parsed = urlparse(self.path)
             length = int(self.headers.get("Content-Length", "0") or "0")
             raw = self.rfile.read(length) if length else b"{}"
+            if parsed.path == "/api/kmz-overlay":
+                try:
+                    name = parse_qs(parsed.query).get("name", ["overlay.kmz"])[0]
+                    self._json(_parse_kmz_preview_features(raw, os.path.basename(name) or "overlay.kmz"))
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 400)
+                return
             try:
                 payload = json.loads(raw.decode("utf-8") or "{}")
             except Exception:
