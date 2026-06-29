@@ -174,6 +174,7 @@ class RenderOptions:
     preview_max_dim: int = 2048  # GUI preview max width/height in pixels
     use_pitch: bool = False  # if True, use pitch_deg in geometry (tilt shift / cos correction)
     crop_optimize: bool = False  # if True, choose front image per-pixel by nearest image-center distance (save only)
+    hfov_deg_override: Optional[float] = None  # if set, override EXIF-derived horizontal FOV for all images
 
 
 class MemoryPressureError(RuntimeError):
@@ -1339,7 +1340,8 @@ def _load_photo_meta(path: str, options: Optional[RenderOptions] = None) -> Opti
             f"Gimbal may not be level: {path} gimbal_roll={gimbal_roll}\n"
         )
 
-    hfov = _extract_fov(tags, w, h)
+    hfov_override = None if options is None else getattr(options, "hfov_deg_override", None)
+    hfov = float(hfov_override) if hfov_override is not None else _extract_fov(tags, w, h)
 
     # If we couldn't parse required fields, fail (caller will report details)
     if lat is None or lon is None or alt is None or yaw is None:
@@ -2349,6 +2351,14 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=float,
         default=0.0,
         help="altitude correction in meters; effective altitude is Relative Altitude + alt_correction",
+    )
+    ap.add_argument(
+        "--hfov-deg",
+        "--fov",
+        dest="hfov_deg",
+        type=float,
+        default=None,
+        help="override horizontal FOV in degrees for all images (default: read/derive from EXIF)",
     )
     ap.add_argument(
         "--yaw-offset",
@@ -4695,6 +4705,9 @@ WEBUI_JS = r"""(() => {
 
 
 def _render_options_from_args(args: argparse.Namespace) -> RenderOptions:
+    hfov_deg = getattr(args, "hfov_deg", None)
+    if hfov_deg is not None and not (0.0 < float(hfov_deg) < 180.0):
+        raise SystemExit("--hfov-deg/--fov must be greater than 0 and less than 180")
     return RenderOptions(
         undistort=bool(getattr(args, "undistort", False)),
         k1=float(getattr(args, "k1", 0.1400)),
@@ -4714,6 +4727,7 @@ def _render_options_from_args(args: argparse.Namespace) -> RenderOptions:
         preview_max_dim=int(getattr(args, "preview_max_pix", 2048)),
         use_pitch=bool(getattr(args, "use_pitch", False)),
         crop_optimize=bool(getattr(args, "crop_optimize", False)),
+        hfov_deg_override=None if hfov_deg is None else float(hfov_deg),
     )
 
 
@@ -4747,6 +4761,7 @@ def _copy_options(
         preview_max_dim=options.preview_max_dim,
         use_pitch=options.use_pitch,
         crop_optimize=options.crop_optimize if crop_optimize is None else bool(crop_optimize),
+        hfov_deg_override=options.hfov_deg_override,
     )
 
 
@@ -5959,6 +5974,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             preview_max_dim=int(getattr(self.options, "preview_max_dim", 2048)),
             use_pitch=bool(getattr(self.options, "use_pitch", False)),
             crop_optimize=bool(getattr(self.options, "crop_optimize", False)),
+            hfov_deg_override=getattr(self.options, "hfov_deg_override", None),
         )
     
     def _generate_preview(self, max_dim: int = 2048) -> Image.Image:
@@ -6671,6 +6687,7 @@ class MosaicGUI(QtWidgets.QMainWindow):
             preview_max_dim=int(getattr(self.options, "preview_max_dim", 2048)),
             use_pitch=bool(getattr(self.options, "use_pitch", False)),
             crop_optimize=bool(getattr(self.options, "crop_optimize", False)),
+            hfov_deg_override=getattr(self.options, "hfov_deg_override", None),
         )
         if hasattr(self, "opacity_label"):
             self.opacity_label.setText(f"{int(value)}%")
